@@ -10,62 +10,71 @@ app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# --- CREDENCIALES Y ROLES COMERCIALES ---
+# --- CREDENCIALES DE SUPER ADMIN ---
 ADMIN_MASTER_USER = "admin"
 ADMIN_MASTER_PASS = "tecsol2026"
 
-# Base de datos de clientes comerciales (Puedes registrar aquí a tus compradores)
-CLIENTES_DB = {
-    "cliente_express": {
-        "password": "password123",
-        "cajas_asignadas": [] # Aquí puedes filtrar cajas específicas si deseas, o dejarlo abierto
-    }
-}
-
+# Base de datos en memoria para clientes registrados
+# Estructura: "usuario": {"password": "...", "aprobado": True/False, "cajas": [...]}
+CLIENTES_REGISTRADOS = {}
 cajas_tecsol = {}
 
-# --- NUEVA RUTA DE LOGIN CON ROLES ---
+# --- RUTA DE REGISTRO PARA NUEVOS CLIENTES ---
+@app.route('/api/registro', methods=['POST'])
+def registrar_cliente():
+    datos = request.get_json() or {}
+    usuario = datos.get("usuario")
+    password = datos.get("password")
+    
+    if not usuario or not password:
+        return jsonify({"status": "error", "mensaje": "Faltan datos"}), 400
+        
+    if usuario in CLIENTES_REGISTRADOS or usuario == ADMIN_MASTER_USER:
+        return jsonify({"status": "error", "mensaje": "El usuario ya existe"}), 400
+        
+    # Se crea el cliente pero inactivo/pendiente de aprobación del Super Admin
+    CLIENTES_REGISTRADOS[usuario] = {
+        "password": password,
+        "aprobado": False # Tú lo apruebas desde el panel admin
+    }
+    
+    return jsonify({"status": "ok", "mensaje": "Registro exitoso. Espere activación del administrador."})
+
+# --- RUTA DE LOGIN ---
 @app.route('/api/login', methods=['POST'])
 def login():
     datos = request.get_json() or {}
     usuario = datos.get("usuario")
     password = datos.get("password")
-
-    # 1. Acceso Administrador Maestro (Tú - TECSOL)
+    
+    # 1. Super Admin
     if usuario == ADMIN_MASTER_USER and password == ADMIN_MASTER_PASS:
-        return jsonify({"status": "ok", "rol": "admin", "mensaje": "Acceso Maestro TECSOL"})
-
-    # 2. Acceso Cliente Final (Dueño del Car Wash)
-    if usuario in CLIENTES_DB and CLIENTES_DB[usuario]["password"] == password:
-        return jsonify({
-            "status": "ok",
-            "rol": "cliente",
-            "usuario": usuario,
-            "cajas_asignadas": CLIENTES_DB[usuario]["cajas_asignadas"],
-            "mensaje": "Acceso Cliente"
-        })
-
+        return jsonify({"status": "ok", "rol": "admin", "clientes": CLIENTES_REGISTRADOS})
+        
+    # 2. Cliente Registrado
+    if usuario in CLIENTES_REGISTRADOS:
+        if CLIENTES_REGISTRADOS[usuario]["password"] == password:
+            if not CLIENTES_REGISTRADOS[usuario]["aprobado"]:
+                return jsonify({"status": "error", "mensaje": "Su cuenta está pendiente de activación por TECSOL."}), 403
+            return jsonify({"status": "ok", "rol": "cliente", "usuario": usuario})
+            
     return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
+
+# --- RUTA PARA QUE EL ADMIN APRUEBE CLIENTES ---
+@app.route('/api/admin/aprobar_cliente', methods=['POST'])
+def aprobar_cliente():
+    datos = request.get_json() or {}
+    usuario = datos.get("usuario")
+    estado = datos.get("aprobado", True)
+    
+    if usuario in CLIENTES_REGISTRADOS:
+        CLIENTES_REGISTRADOS[usuario]["aprobado"] = estado
+        return jsonify({"status": "ok", "mensaje": "Estado de cliente actualizado"})
+    return jsonify({"status": "error", "mensaje": "Cliente no encontrado"}), 404
 
 @app.route('/api/cajas', methods=['GET'])
 def obtener_cajas():
     return jsonify(cajas_tecsol)
-
-@app.route('/api/cajas', methods=['POST'])
-def agregar_caja():
-    datos = request.get_json() or {}
-    id_caja = f"caja_{str(uuid.uuid4())[:4]}"
-    nueva_caja = {
-        "id": id_caja,
-        "nombre": datos.get("nombre", "Nueva Caja"),
-        "tipo": datos.get("tipo", "Agua"),
-        "monedas": 0,
-        "yape": 0.0,
-        "activo": True # Control de licencia/suscripción por defecto activo
-    }
-    cajas_tecsol[id_caja] = nueva_caja
-    socketio.emit('actualizacion_cajas', cajas_tecsol)
-    return jsonify(nueva_caja)
 
 @app.route('/api/cajas/<id_caja>', methods=['PUT'])
 def actualizar_caja(id_caja):
@@ -75,10 +84,9 @@ def actualizar_caja(id_caja):
         cajas_tecsol[id_caja]["tipo"] = datos.get("tipo", cajas_tecsol[id_caja]["tipo"])
         if 'activo' in datos:
             cajas_tecsol[id_caja]["activo"] = datos.get("activo")
-
         socketio.emit('actualizacion_cajas', cajas_tecsol)
-        return jsonify({"status": "ok", "caja": cajas_tecsol[id_caja]})
-    return jsonify({"status": "error", "mensaje": "Caja no encontrada"}), 404
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error"}), 404
 
 @app.route('/api/cajas/<id_caja>/reset', methods=['POST'])
 def reiniciar_caja(id_caja):
@@ -86,27 +94,20 @@ def reiniciar_caja(id_caja):
         cajas_tecsol[id_caja]["monedas"] = 0
         cajas_tecsol[id_caja]["yape"] = 0.0
         socketio.emit('actualizacion_cajas', cajas_tecsol)
-        return jsonify({"status": "ok", "caja": cajas_tecsol[id_caja]})
-    return jsonify({"status": "error", "mensaje": "Caja no encontrada"}), 404
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error"}), 404
 
 @app.route('/ingresar_moneda', methods=['POST'])
 def ingresar_moneda():
     datos = request.get_json() or {}
     id_caja = datos.get("id_caja")
     if not id_caja:
-        return jsonify({"status": "error", "mensaje": "ID no proporcionado"}), 400
+        return jsonify({"status": "error"}), 400
     if id_caja not in cajas_tecsol:
-        cajas_tecsol[id_caja] = {
-            "id": id_caja,
-            "nombre": "Nueva Caja Pendiente",
-            "tipo": "No asignado",
-            "monedas": 0,
-            "yape": 0.0,
-            "activo": True
-        }
+        cajas_tecsol[id_caja] = {"id": id_caja, "nombre": "Caja Nueva", "tipo": "Agua", "monedas": 0, "yape": 0.0, "activo": True}
     cajas_tecsol[id_caja]["monedas"] += 1
     socketio.emit('actualizacion_cajas', cajas_tecsol)
-    return jsonify({"status": "ok", "caja": cajas_tecsol[id_caja]})
+    return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
