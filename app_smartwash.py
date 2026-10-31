@@ -1,9 +1,11 @@
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 import uuid
-import eventlet
-eventlet.monkey_patch()
+
 
 app = Flask(__name__)
 CORS(app)
