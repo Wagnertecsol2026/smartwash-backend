@@ -6,26 +6,45 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 import uuid
 
-
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# --- CREDENCIALES DE ADMINISTRADOR ---
-USUARIO_ADMIN = "admin"
-PASSWORD_ADMIN = "tecsol2026"
+# --- CREDENCIALES Y ROLES COMERCIALES ---
+ADMIN_MASTER_USER = "admin"
+ADMIN_MASTER_PASS = "tecsol2026"
+
+# Base de datos de clientes comerciales (Puedes registrar aquí a tus compradores)
+CLIENTES_DB = {
+    "cliente_express": {
+        "password": "password123",
+        "cajas_asignadas": [] # Aquí puedes filtrar cajas específicas si deseas, o dejarlo abierto
+    }
+}
 
 cajas_tecsol = {}
 
-# --- NUEVA RUTA DE LOGIN ---
+# --- NUEVA RUTA DE LOGIN CON ROLES ---
 @app.route('/api/login', methods=['POST'])
 def login():
     datos = request.get_json() or {}
     usuario = datos.get("usuario")
     password = datos.get("password")
 
-    if usuario == USUARIO_ADMIN and password == PASSWORD_ADMIN:
-        return jsonify({"status": "ok", "mensaje": "Acceso permitido"})
+    # 1. Acceso Administrador Maestro (Tú - TECSOL)
+    if usuario == ADMIN_MASTER_USER and password == ADMIN_MASTER_PASS:
+        return jsonify({"status": "ok", "rol": "admin", "mensaje": "Acceso Maestro TECSOL"})
+
+    # 2. Acceso Cliente Final (Dueño del Car Wash)
+    if usuario in CLIENTES_DB and CLIENTES_DB[usuario]["password"] == password:
+        return jsonify({
+            "status": "ok",
+            "rol": "cliente",
+            "usuario": usuario,
+            "cajas_asignadas": CLIENTES_DB[usuario]["cajas_asignadas"],
+            "mensaje": "Acceso Cliente"
+        })
+
     return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
 
 @app.route('/api/cajas', methods=['GET'])
@@ -41,7 +60,8 @@ def agregar_caja():
         "nombre": datos.get("nombre", "Nueva Caja"),
         "tipo": datos.get("tipo", "Agua"),
         "monedas": 0,
-        "yape": 0.0
+        "yape": 0.0,
+        "activo": True # Control de licencia/suscripción por defecto activo
     }
     cajas_tecsol[id_caja] = nueva_caja
     socketio.emit('actualizacion_cajas', cajas_tecsol)
@@ -53,6 +73,9 @@ def actualizar_caja(id_caja):
     if id_caja in cajas_tecsol:
         cajas_tecsol[id_caja]["nombre"] = datos.get("nombre", cajas_tecsol[id_caja]["nombre"])
         cajas_tecsol[id_caja]["tipo"] = datos.get("tipo", cajas_tecsol[id_caja]["tipo"])
+        if 'activo' in datos:
+            cajas_tecsol[id_caja]["activo"] = datos.get("activo")
+
         socketio.emit('actualizacion_cajas', cajas_tecsol)
         return jsonify({"status": "ok", "caja": cajas_tecsol[id_caja]})
     return jsonify({"status": "error", "mensaje": "Caja no encontrada"}), 404
@@ -78,7 +101,8 @@ def ingresar_moneda():
             "nombre": "Nueva Caja Pendiente",
             "tipo": "No asignado",
             "monedas": 0,
-            "yape": 0.0
+            "yape": 0.0,
+            "activo": True
         }
     cajas_tecsol[id_caja]["monedas"] += 1
     socketio.emit('actualizacion_cajas', cajas_tecsol)
