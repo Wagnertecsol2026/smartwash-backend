@@ -10,16 +10,13 @@ app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# --- CREDENCIALES DE SUPER ADMIN ---
 ADMIN_MASTER_USER = "admin"
 ADMIN_MASTER_PASS = "tecsol2026"
 
-# Base de datos en memoria para clientes registrados
-# Estructura: "usuario": {"password": "...", "aprobado": True/False, "cajas": [...]}
+# Estructura de clientes: {"usuario": {"password": "...", "aprobado": True}}
 CLIENTES_REGISTRADOS = {}
 cajas_tecsol = {}
 
-# --- RUTA DE REGISTRO PARA NUEVOS CLIENTES ---
 @app.route('/api/registro', methods=['POST'])
 def registrar_cliente():
     datos = request.get_json() or {}
@@ -32,35 +29,29 @@ def registrar_cliente():
     if usuario in CLIENTES_REGISTRADOS or usuario == ADMIN_MASTER_USER:
         return jsonify({"status": "error", "mensaje": "El usuario ya existe"}), 400
         
-    # Se crea el cliente pero inactivo/pendiente de aprobación del Super Admin
     CLIENTES_REGISTRADOS[usuario] = {
         "password": password,
-        "aprobado": False # Tú lo apruebas desde el panel admin
+        "aprobado": False
     }
-    
     return jsonify({"status": "ok", "mensaje": "Registro exitoso. Espere activación del administrador."})
 
-# --- RUTA DE LOGIN ---
 @app.route('/api/login', methods=['POST'])
 def login():
     datos = request.get_json() or {}
     usuario = datos.get("usuario")
     password = datos.get("password")
     
-    # 1. Super Admin
     if usuario == ADMIN_MASTER_USER and password == ADMIN_MASTER_PASS:
         return jsonify({"status": "ok", "rol": "admin", "clientes": CLIENTES_REGISTRADOS})
         
-    # 2. Cliente Registrado
     if usuario in CLIENTES_REGISTRADOS:
         if CLIENTES_REGISTRADOS[usuario]["password"] == password:
             if not CLIENTES_REGISTRADOS[usuario]["aprobado"]:
-                return jsonify({"status": "error", "mensaje": "Su cuenta está pendiente de activación por TECSOL."}), 403
+                return jsonify({"status": "error", "mensaje": "Cuenta pendiente de activación por TECSOL."}), 403
             return jsonify({"status": "ok", "rol": "cliente", "usuario": usuario})
             
     return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
 
-# --- RUTA PARA QUE EL ADMIN APRUEBE CLIENTES ---
 @app.route('/api/admin/aprobar_cliente', methods=['POST'])
 def aprobar_cliente():
     datos = request.get_json() or {}
@@ -69,8 +60,8 @@ def aprobar_cliente():
     
     if usuario in CLIENTES_REGISTRADOS:
         CLIENTES_REGISTRADOS[usuario]["aprobado"] = estado
-        return jsonify({"status": "ok", "mensaje": "Estado de cliente actualizado"})
-    return jsonify({"status": "error", "mensaje": "Cliente no encontrado"}), 404
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error"}), 404
 
 @app.route('/api/cajas', methods=['GET'])
 def obtener_cajas():
@@ -84,6 +75,8 @@ def actualizar_caja(id_caja):
         cajas_tecsol[id_caja]["tipo"] = datos.get("tipo", cajas_tecsol[id_caja]["tipo"])
         if 'activo' in datos:
             cajas_tecsol[id_caja]["activo"] = datos.get("activo")
+        if 'propietario' in datos:
+            cajas_tecsol[id_caja]["propietario"] = datos.get("propietario")
         socketio.emit('actualizacion_cajas', cajas_tecsol)
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
@@ -104,7 +97,15 @@ def ingresar_moneda():
     if not id_caja:
         return jsonify({"status": "error"}), 400
     if id_caja not in cajas_tecsol:
-        cajas_tecsol[id_caja] = {"id": id_caja, "nombre": "Caja Nueva", "tipo": "Agua", "monedas": 0, "yape": 0.0, "activo": True}
+        cajas_tecsol[id_caja] = {
+            "id": id_caja, 
+            "nombre": "Caja Nueva", 
+            "tipo": "Agua", 
+            "monedas": 0, 
+            "yape": 0.0, 
+            "activo": True,
+            "propietario": "sin_asignar" # Se puede asignar desde el admin
+        }
     cajas_tecsol[id_caja]["monedas"] += 1
     socketio.emit('actualizacion_cajas', cajas_tecsol)
     return jsonify({"status": "ok"})
