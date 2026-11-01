@@ -11,7 +11,7 @@ import os
 import json
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["https://smartwashtecsol.web.app"])
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # --- INICIALIZAR FIREBASE SEGURO ---
