@@ -18,11 +18,11 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 firebase_env = os.environ.get("FIREBASE_CONFIG_JSON")
 
 if firebase_env:
-    # Cargar credenciales desde la variable de entorno en Render
+    # Si estamos en Render, lee la variable de entorno secreta
     cred_dict = json.loads(firebase_env)
     cred = credentials.Certificate(cred_dict)
 else:
-    # Cargar credenciales desde el archivo local (para pruebas en tu laptop)
+    # Si estamos en tu laptop, lee el archivo local 'firebase_key.json'
     cred = credentials.Certificate("firebase_key.json")
 
 firebase_admin.initialize_app(cred)
