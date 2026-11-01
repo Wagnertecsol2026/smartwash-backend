@@ -5,18 +5,42 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from datetime import datetime, timedelta
+import firebase_admin
+from firebase_admin import credentials, firestore
+import os
+import json
 
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+# --- INICIALIZAR FIREBASE SEGURO ---
+firebase_env = os.environ.get("FIREBASE_CONFIG_JSON")
+
+if firebase_env:
+    # Cargar credenciales desde la variable de entorno en Render
+    cred_dict = json.loads(firebase_env)
+    cred = credentials.Certificate(cred_dict)
+else:
+    # Cargar credenciales desde el archivo local (para pruebas en tu laptop)
+    cred = credentials.Certificate("firebase_key.json")
+
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
 ADMIN_MASTER_USER = "admin"
 ADMIN_MASTER_PASS = "tecsol2026"
 
-CLIENTES_REGISTRADOS = {}
-cajas_tecsol = {}
-# Estructura de historial por caja: { "id_caja": [ {"fecha": "2026-10-31", "monto": 1.0, "tipo": "moneda"} ] }
-historial_transacciones = {}
+# --- FUNCIONES DE APOYO PARA SINCRONIZAR CON FIRESTORE ---
+def obtener_clientes_db():
+    docs = db.collection('clientes').stream()
+    return {doc.id: doc.to_dict() for doc in docs}
+
+def obtener_cajas_db():
+    docs = db.collection('cajas').stream()
+    return {doc.id: doc.to_dict() for doc in docs}
+
+# --- RUTAS DE LA API ---
 
 @app.route('/api/registro', methods=['POST'])
 def registrar_cliente():
@@ -27,10 +51,14 @@ def registrar_cliente():
     if not usuario or not password:
         return jsonify({"status": "error", "mensaje": "Faltan datos"}), 400
 
-    if usuario in CLIENTES_REGISTRADOS or usuario == ADMIN_MASTER_USER:
+    clientes = obtener_clientes_db()
+    if usuario in clientes or usuario == ADMIN_MASTER_USER:
         return jsonify({"status": "error", "mensaje": "El usuario ya existe"}), 400
 
-    CLIENTES_REGISTRADOS[usuario] = {"password": password, "aprobado": False}
+    db.collection('clientes').document(usuario).set({
+        "password": password,
+        "aprobado": False
+    })
     return jsonify({"status": "ok", "mensaje": "Registro exitoso. Espere activación del administrador."})
 
 @app.route('/api/login', methods=['POST'])
@@ -40,11 +68,12 @@ def login():
     password = datos.get("password")
 
     if usuario == ADMIN_MASTER_USER and password == ADMIN_MASTER_PASS:
-        return jsonify({"status": "ok", "rol": "admin", "clientes": CLIENTES_REGISTRADOS})
+        return jsonify({"status": "ok", "rol": "admin", "clientes": obtener_clientes_db()})
 
-    if usuario in CLIENTES_REGISTRADOS:
-        if CLIENTES_REGISTRADOS[usuario]["password"] == password:
-            if not CLIENTES_REGISTRADOS[usuario]["aprobado"]:
+    clientes = obtener_clientes_db()
+    if usuario in clientes:
+        if clientes[usuario]["password"] == password:
+            if not clientes[usuario]["aprobado"]:
                 return jsonify({"status": "error", "mensaje": "Cuenta pendiente de activación por TECSOL."}), 403
             return jsonify({"status": "ok", "rol": "cliente", "usuario": usuario})
 
@@ -56,8 +85,9 @@ def aprobar_cliente():
     usuario = datos.get("usuario")
     estado = datos.get("aprobado", True)
 
-    if usuario in CLIENTES_REGISTRADOS:
-        CLIENTES_REGISTRADOS[usuario]["aprobado"] = estado
+    clientes = obtener_clientes_db()
+    if usuario in clientes:
+        db.collection('clientes').document(usuario).update({"aprobado": estado})
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
 
@@ -67,8 +97,9 @@ def admin_cambiar_password():
     usuario = datos.get("usuario")
     nuevo_password = datos.get("nuevo_password")
 
-    if usuario in CLIENTES_REGISTRADOS and nuevo_password:
-        CLIENTES_REGISTRADOS[usuario]["password"] = nuevo_password
+    clientes = obtener_clientes_db()
+    if usuario in clientes and nuevo_password:
+        db.collection('clientes').document(usuario).update({"password": nuevo_password})
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
 
@@ -79,9 +110,10 @@ def cliente_cambiar_password():
     password_actual = datos.get("password_actual")
     nuevo_password = datos.get("nuevo_password")
 
-    if usuario in CLIENTES_REGISTRADOS:
-        if CLIENTES_REGISTRADOS[usuario]["password"] == password_actual:
-            CLIENTES_REGISTRADOS[usuario]["password"] = nuevo_password
+    clientes = obtener_clientes_db()
+    if usuario in clientes:
+        if clientes[usuario]["password"] == password_actual:
+            db.collection('clientes').document(usuario).update({"password": nuevo_password})
             return jsonify({"status": "ok"})
         else:
             return jsonify({"status": "error", "mensaje": "Contraseña incorrecta"}), 401
@@ -89,40 +121,48 @@ def cliente_cambiar_password():
 
 @app.route('/api/cajas', methods=['GET'])
 def obtener_cajas():
-    return jsonify(cajas_tecsol)
+    return jsonify(obtener_cajas_db())
 
 @app.route('/api/cajas/<id_caja>/historial', methods=['GET'])
 def obtener_historial(id_caja):
-    transacciones = historial_transacciones.get(id_caja, [])
-    # Agrupar por fecha
+    ref = db.collection('cajas').document(id_caja).collection('historial').stream()
     reporte_dias = {}
-    for t in transacciones:
-        fec = t["fecha"]
-        reporte_dias[fec] = reporte_dias.get(fec, 0.0) + t["monto"]
+    for doc in ref:
+        data = doc.to_dict()
+        fec = data.get("fecha")
+        monto = data.get("monto", 0.0)
+        reporte_dias[fec] = reporte_dias.get(fec, 0.0) + monto
     return jsonify(reporte_dias)
 
 @app.route('/api/cajas/<id_caja>', methods=['PUT'])
 def actualizar_caja(id_caja):
     datos = request.get_json() or {}
-    if id_caja in cajas_tecsol:
-        cajas_tecsol[id_caja]["nombre"] = datos.get("nombre", cajas_tecsol[id_caja]["nombre"])
-        cajas_tecsol[id_caja]["tipo"] = datos.get("tipo", cajas_tecsol[id_caja]["tipo"])
-        if 'activo' in datos:
-            cajas_tecsol[id_caja]["activo"] = datos.get("activo")
-        if 'propietario' in datos:
-            cajas_tecsol[id_caja]["propietario"] = datos.get("propietario")
-        socketio.emit('actualizacion_cajas', cajas_tecsol)
+    cajas = obtener_cajas_db()
+
+    if id_caja in cajas:
+        update_data = {}
+        if "nombre" in datos: update_data["nombre"] = datos["nombre"]
+        if "tipo" in datos: update_data["tipo"] = datos["tipo"]
+        if "activo" in datos: update_data["activo"] = datos["activo"]
+        if "propietario" in datos: update_data["propietario"] = datos["propietario"]
+
+        db.collection('cajas').document(id_caja).update(update_data)
+        socketio.emit('actualizacion_cajas', obtener_cajas_db())
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
 
 @app.route('/api/cajas/<id_caja>/reset', methods=['POST'])
 def reiniciar_caja(id_caja):
-    if id_caja in cajas_tecsol:
-        cajas_tecsol[id_caja]["monedas"] = 0
-        cajas_tecsol[id_caja]["yape"] = 0.0
-        if id_caja in historial_transacciones:
-            historial_transacciones[id_caja] = [] # Limpiar historial al reiniciar contadores si se desea
-        socketio.emit('actualizacion_cajas', cajas_tecsol)
+    cajas = obtener_cajas_db()
+    if id_caja in cajas:
+        db.collection('cajas').document(id_caja).update({"monedas": 0, "yape": 0.0})
+
+        # Limpiar historial al reiniciar contadores
+        hist_ref = db.collection('cajas').document(id_caja).collection('historial').stream()
+        for doc in hist_ref:
+            doc.reference.delete()
+
+        socketio.emit('actualizacion_cajas', obtener_cajas_db())
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
 
@@ -137,28 +177,32 @@ def ingresar_moneda():
     zona_peru = timedelta(hours=-5)
     fecha_hoy = (datetime.utcnow() + zona_peru).strftime("%Y-%m-%d")
 
-    if id_caja not in cajas_tecsol:
-        cajas_tecsol[id_caja] = {
+    caja_ref = db.collection('cajas').document(id_caja)
+    caja_doc = caja_ref.get()
+
+    if not caja_doc.exists:
+        caja_ref.set({
             "id": id_caja,
             "nombre": "Caja Nueva",
             "tipo": "Agua",
-            "monedas": 0,
+            "monedas": 1,
             "yape": 0.0,
             "activo": True,
             "propietario": "sin_asignar"
-        }
-        historial_transacciones[id_caja] = []
+        })
+    else:
+        caja_ref.update({
+            "monedas": firestore.Increment(1)
+        })
 
-    cajas_tecsol[id_caja]["monedas"] += 1
-
-    # Registrar en el historial con la fecha de Perú
-    historial_transacciones[id_caja].append({
+    # Registrar en la subcolección de historial con la fecha de Perú
+    caja_ref.collection('historial').add({
         "fecha": fecha_hoy,
         "monto": 1.0,
         "tipo": "moneda"
     })
 
-    socketio.emit('actualizacion_cajas', cajas_tecsol)
+    socketio.emit('actualizacion_cajas', obtener_cajas_db())
     return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
