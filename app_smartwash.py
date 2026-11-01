@@ -4,7 +4,7 @@ eventlet.monkey_patch()
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
@@ -23,13 +23,13 @@ def registrar_cliente():
     datos = request.get_json() or {}
     usuario = datos.get("usuario")
     password = datos.get("password")
-    
+
     if not usuario or not password:
         return jsonify({"status": "error", "mensaje": "Faltan datos"}), 400
-        
+
     if usuario in CLIENTES_REGISTRADOS or usuario == ADMIN_MASTER_USER:
         return jsonify({"status": "error", "mensaje": "El usuario ya existe"}), 400
-        
+
     CLIENTES_REGISTRADOS[usuario] = {"password": password, "aprobado": False}
     return jsonify({"status": "ok", "mensaje": "Registro exitoso. Espere activación del administrador."})
 
@@ -38,16 +38,16 @@ def login():
     datos = request.get_json() or {}
     usuario = datos.get("usuario")
     password = datos.get("password")
-    
+
     if usuario == ADMIN_MASTER_USER and password == ADMIN_MASTER_PASS:
         return jsonify({"status": "ok", "rol": "admin", "clientes": CLIENTES_REGISTRADOS})
-        
+
     if usuario in CLIENTES_REGISTRADOS:
         if CLIENTES_REGISTRADOS[usuario]["password"] == password:
             if not CLIENTES_REGISTRADOS[usuario]["aprobado"]:
                 return jsonify({"status": "error", "mensaje": "Cuenta pendiente de activación por TECSOL."}), 403
             return jsonify({"status": "ok", "rol": "cliente", "usuario": usuario})
-            
+
     return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
 
 @app.route('/api/admin/aprobar_cliente', methods=['POST'])
@@ -55,7 +55,7 @@ def aprobar_cliente():
     datos = request.get_json() or {}
     usuario = datos.get("usuario")
     estado = datos.get("aprobado", True)
-    
+
     if usuario in CLIENTES_REGISTRADOS:
         CLIENTES_REGISTRADOS[usuario]["aprobado"] = estado
         return jsonify({"status": "ok"})
@@ -66,7 +66,7 @@ def admin_cambiar_password():
     datos = request.get_json() or {}
     usuario = datos.get("usuario")
     nuevo_password = datos.get("nuevo_password")
-    
+
     if usuario in CLIENTES_REGISTRADOS and nuevo_password:
         CLIENTES_REGISTRADOS[usuario]["password"] = nuevo_password
         return jsonify({"status": "ok"})
@@ -78,7 +78,7 @@ def cliente_cambiar_password():
     usuario = datos.get("usuario")
     password_actual = datos.get("password_actual")
     nuevo_password = datos.get("nuevo_password")
-    
+
     if usuario in CLIENTES_REGISTRADOS:
         if CLIENTES_REGISTRADOS[usuario]["password"] == password_actual:
             CLIENTES_REGISTRADOS[usuario]["password"] = nuevo_password
@@ -132,9 +132,11 @@ def ingresar_moneda():
     id_caja = datos.get("id_caja")
     if not id_caja:
         return jsonify({"status": "error"}), 400
-        
-    fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-    
+
+    # Ajustar fecha a la hora local de Perú (UTC-5)
+    zona_peru = timedelta(hours=-5)
+    fecha_hoy = (datetime.utcnow() + zona_peru).strftime("%Y-%m-%d")
+
     if id_caja not in cajas_tecsol:
         cajas_tecsol[id_caja] = {
             "id": id_caja,
@@ -146,16 +148,16 @@ def ingresar_moneda():
             "propietario": "sin_asignar"
         }
         historial_transacciones[id_caja] = []
-        
+
     cajas_tecsol[id_caja]["monedas"] += 1
-    
-    # Registrar en el historial de la fecha
+
+    # Registrar en el historial con la fecha de Perú
     historial_transacciones[id_caja].append({
         "fecha": fecha_hoy,
         "monto": 1.0,
         "tipo": "moneda"
     })
-    
+
     socketio.emit('actualizacion_cajas', cajas_tecsol)
     return jsonify({"status": "ok"})
 
