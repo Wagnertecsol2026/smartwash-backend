@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import firebase_admin
 from firebase_admin import credentials, firestore
 import os
@@ -57,8 +57,33 @@ def obtener_cajas_db():
     return resultado
 
 
+def convertir_valores_para_json(valor):
+    """Convierte tipos de Firestore (por ejemplo timestamps) a JSON seguro."""
+    if isinstance(valor, datetime):
+        return valor.isoformat()
+    if isinstance(valor, date):
+        return valor.isoformat()
+    if isinstance(valor, dict):
+        return {str(clave): convertir_valores_para_json(dato)
+                for clave, dato in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [convertir_valores_para_json(dato) for dato in valor]
+    return valor
+
+
 def emitir_actualizacion_cajas():
-    socketio.emit("actualizacion_cajas", obtener_cajas_db())
+    """Emite cambios en tiempo real sin hacer fallar el POST ya guardado."""
+    try:
+        cajas = obtener_cajas_db()
+        cajas_json = convertir_valores_para_json(cajas)
+        socketio.emit("actualizacion_cajas", cajas_json)
+    except Exception:
+        # Una falla de Socket.IO no debe convertir en HTTP 500 una escritura
+        # que ya se realizó correctamente en Firestore.
+        app.logger.exception(
+            "No se pudo emitir actualizacion_cajas por Socket.IO. "
+            "La operación de Firestore puede haberse guardado correctamente."
+        )
 
 
 # --- RUTAS DE LA API ---
@@ -181,7 +206,7 @@ def cliente_cambiar_password():
 
 @app.route("/api/cajas", methods=["GET"])
 def obtener_cajas():
-    return jsonify(obtener_cajas_db())
+    return jsonify(convertir_valores_para_json(obtener_cajas_db()))
 
 
 @app.route("/api/cajas/<id_caja>/historial", methods=["GET"])
