@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore
 import os
@@ -41,18 +41,52 @@ db = firestore.client()
 ADMIN_MASTER_USER = os.environ.get("ADMIN_MASTER_USER", "admin")
 ADMIN_MASTER_PASS = os.environ.get("ADMIN_MASTER_PASS", "")
 
+# Un ESP32 se considera conectado si envio heartbeat en los ultimos 150 segundos.
+ESP32_ONLINE_TIMEOUT_SECONDS = 150
+
 # --- FUNCIONES DE APOYO ---
 def obtener_clientes_db():
     docs = db.collection("clientes").stream()
     return {doc.id: doc.to_dict() for doc in docs}
 
 
+def _timestamp_a_datetime(valor):
+    """Normaliza Timestamp de Firestore o texto ISO a datetime UTC."""
+    if isinstance(valor, datetime):
+        dt = valor
+    elif isinstance(valor, str):
+        try:
+            dt = datetime.fromisoformat(valor.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _esp32_esta_conectado(datos):
+    ultima = _timestamp_a_datetime(datos.get("ultima_conexion"))
+    if ultima is None:
+        return False
+
+    segundos = (datetime.now(timezone.utc) - ultima).total_seconds()
+    # Margen pequeño por diferencias de reloj; el timestamp normalmente
+    # procede de firestore.SERVER_TIMESTAMP.
+    return -60 <= segundos <= ESP32_ONLINE_TIMEOUT_SECONDS
+
+
 def obtener_cajas_db():
-    """Devuelve las cajas y garantiza que cada objeto incluya su ID de documento."""
+    """Devuelve cajas con ID y estado de conectividad calculado por heartbeat."""
     resultado = {}
     for doc in db.collection("cajas").stream():
         datos = doc.to_dict() or {}
         datos.setdefault("id", doc.id)
+        conectado = _esp32_esta_conectado(datos)
+        datos["conectado"] = conectado
+        datos["estado_conexion"] = "conectado" if conectado else "sin_conexion"
         resultado[doc.id] = datos
     return resultado
 
@@ -321,6 +355,35 @@ def registrar_dispositivo():
     }), codigo
 
 
+@app.route("/api/dispositivos/heartbeat", methods=["POST"])
+def heartbeat_dispositivo():
+    """Registra que el ESP32 sigue activo y comunicandose con Render."""
+    datos = request.get_json(silent=True) or {}
+    id_caja = str(datos.get("id_caja") or "").strip()
+    mac = str(datos.get("mac") or "").strip().upper()
+
+    if not id_caja or not re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", mac):
+        return jsonify({"status": "error", "mensaje": "id_caja o MAC inválida"}), 400
+
+    caja_ref = db.collection("cajas").document(id_caja)
+    caja_doc = caja_ref.get()
+    if not caja_doc.exists:
+        return jsonify({"status": "error", "mensaje": "Dispositivo no registrado"}), 404
+
+    datos_caja = caja_doc.to_dict() or {}
+    mac_guardada = str(datos_caja.get("mac") or "").strip().upper()
+    if mac_guardada and mac_guardada != mac:
+        return jsonify({"status": "error", "mensaje": "La MAC no coincide con el dispositivo registrado"}), 403
+
+    caja_ref.update({
+        "mac": mac,
+        "ultima_conexion": firestore.SERVER_TIMESTAMP
+    })
+
+    emitir_actualizacion_cajas()
+    return jsonify({"status": "ok", "id_caja": id_caja, "conectado": True}), 200
+
+
 @app.route("/ingresar_moneda", methods=["POST"])
 def ingresar_moneda():
     datos = request.get_json(silent=True) or {}
@@ -369,3 +432,5 @@ def ingresar_moneda():
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
+
