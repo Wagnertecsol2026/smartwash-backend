@@ -7,6 +7,9 @@ from firebase_admin import credentials, firestore
 import os
 import json
 import re
+import hashlib
+import hmac
+import secrets
 
 app = Flask(__name__)
 
@@ -48,6 +51,54 @@ ESP32_ONLINE_TIMEOUT_SECONDS = 150
 def obtener_clientes_db():
     docs = db.collection("clientes").stream()
     return {doc.id: doc.to_dict() for doc in docs}
+
+
+def obtener_clientes_para_admin():
+    """Devuelve datos de clientes sin incluir sus contraseñas (ni hashes)."""
+    clientes = obtener_clientes_db()
+    resultado = {}
+    for usuario, datos in clientes.items():
+        datos_seguros = dict(datos or {})
+        datos_seguros.pop("password", None)
+        resultado[usuario] = datos_seguros
+    return resultado
+
+
+PASSWORD_HASH_ITERATIONS = 260000
+
+
+def _crear_hash_password(password):
+    """Genera un hash PBKDF2 con sal aleatoria usando solo la biblioteca estándar."""
+    sal = secrets.token_hex(16)
+    derivada = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), sal.encode("utf-8"), PASSWORD_HASH_ITERATIONS
+    )
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${sal}${derivada.hex()}"
+
+
+def _verificar_password(password_guardada, password_ingresada):
+    """Acepta hashes PBKDF2 nuevos y contraseñas antiguas en texto plano."""
+    if not isinstance(password_guardada, str) or not password_guardada:
+        return False
+    if password_guardada.startswith("pbkdf2_sha256$"):
+        try:
+            algoritmo, iteraciones_texto, sal, hash_esperado = password_guardada.split("$", 3)
+            iteraciones = int(iteraciones_texto)
+            if algoritmo != "pbkdf2_sha256" or not 100000 <= iteraciones <= 1000000:
+                return False
+            derivada = hashlib.pbkdf2_hmac(
+                "sha256", password_ingresada.encode("utf-8"), sal.encode("utf-8"), iteraciones
+            ).hex()
+            return hmac.compare_digest(derivada, hash_esperado)
+        except (ValueError, TypeError):
+            return False
+    # Compatibilidad con cuentas antiguas que guardaban la contraseña en texto plano.
+    return hmac.compare_digest(password_guardada.encode("utf-8"), password_ingresada.encode("utf-8"))
+
+
+def _migrar_password_si_antigua(ref, password_guardada):
+    if isinstance(password_guardada, str) and not password_guardada.startswith("pbkdf2_sha256$"):
+        ref.update({"password": _crear_hash_password(password_guardada)})
 
 
 def _timestamp_a_datetime(valor):
@@ -132,11 +183,13 @@ def registrar_cliente():
         return jsonify({"status": "error", "mensaje": "Faltan datos"}), 400
 
     clientes = obtener_clientes_db()
-    if usuario in clientes or usuario == ADMIN_MASTER_USER:
+    consumidor_existente = db.collection("consumidores").document(usuario).get().exists
+    if usuario in clientes or consumidor_existente or usuario == ADMIN_MASTER_USER:
         return jsonify({"status": "error", "mensaje": "El usuario ya existe"}), 400
 
     db.collection("clientes").document(usuario).set({
-        "password": password,
+        "password": _crear_hash_password(password),
+        "rol": "propietario",
         "aprobado": False
     })
     return jsonify({
@@ -154,6 +207,7 @@ def login():
     if not usuario or not password:
         return jsonify({"status": "error", "mensaje": "Faltan usuario y contraseña"}), 400
 
+    # Perfil 1: administrador TECSOL.
     if usuario == ADMIN_MASTER_USER:
         if not ADMIN_MASTER_PASS:
             app.logger.error("Falta configurar ADMIN_MASTER_PASS")
@@ -168,26 +222,87 @@ def login():
         return jsonify({
             "status": "ok",
             "rol": "admin",
-            "clientes": obtener_clientes_db()
+            "clientes": obtener_clientes_para_admin()
         }), 200
 
-    clientes = obtener_clientes_db()
-    cliente = clientes.get(usuario)
+    # Perfil 2: propietario de autolavado. Conserva la aprobación TECSOL.
+    cliente_ref = db.collection("clientes").document(usuario)
+    cliente_doc = cliente_ref.get()
+    if cliente_doc.exists:
+        cliente = cliente_doc.to_dict() or {}
+        password_guardada = cliente.get("password", "")
+        if not _verificar_password(password_guardada, password):
+            return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
 
-    if cliente is None or cliente.get("password") != password:
-        return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
+        _migrar_password_si_antigua(cliente_ref, password_guardada)
+        if not cliente.get("aprobado", False):
+            return jsonify({
+                "status": "error",
+                "mensaje": "Cuenta pendiente de activación por TECSOL."
+            }), 403
 
-    if not cliente.get("aprobado", False):
         return jsonify({
-            "status": "error",
-            "mensaje": "Cuenta pendiente de activación por TECSOL."
-        }), 403
+            "status": "ok",
+            "rol": "propietario",
+            "usuario": usuario,
+            "nombre_local": cliente.get("nombre_local") or usuario
+        }), 200
 
+    # Perfil 3: consumidor. No requiere aprobación del administrador.
+    consumidor_ref = db.collection("consumidores").document(usuario)
+    consumidor_doc = consumidor_ref.get()
+    if consumidor_doc.exists:
+        consumidor = consumidor_doc.to_dict() or {}
+        password_guardada = consumidor.get("password", "")
+        if not _verificar_password(password_guardada, password):
+            return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
+        if consumidor.get("activo", True) is not True:
+            return jsonify({"status": "error", "mensaje": "La cuenta se encuentra desactivada."}), 403
+
+        _migrar_password_si_antigua(consumidor_ref, password_guardada)
+        return jsonify({
+            "status": "ok",
+            "rol": "consumidor",
+            "usuario": usuario,
+            "nombre": consumidor.get("nombre") or usuario
+        }), 200
+
+    return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
+
+
+@app.route("/api/registro_consumidor", methods=["POST"])
+def registrar_consumidor():
+    datos = request.get_json(silent=True) or {}
+    usuario = str(datos.get("usuario") or "").strip()
+    password = str(datos.get("password") or "")
+    nombre = str(datos.get("nombre") or "").strip()
+    telefono = str(datos.get("telefono") or "").strip()
+
+    if not usuario or not password or not nombre:
+        return jsonify({"status": "error", "mensaje": "Completa nombre, usuario y contraseña."}), 400
+    if len(password) < 6:
+        return jsonify({"status": "error", "mensaje": "La contraseña debe tener al menos 6 caracteres."}), 400
+    if usuario == ADMIN_MASTER_USER:
+        return jsonify({"status": "error", "mensaje": "El usuario ya está reservado."}), 400
+
+    if db.collection("clientes").document(usuario).get().exists:
+        return jsonify({"status": "error", "mensaje": "Ese usuario ya pertenece a un local."}), 409
+    consumidor_ref = db.collection("consumidores").document(usuario)
+    if consumidor_ref.get().exists:
+        return jsonify({"status": "error", "mensaje": "El usuario ya existe."}), 409
+
+    consumidor_ref.set({
+        "nombre": nombre,
+        "telefono": telefono,
+        "password": _crear_hash_password(password),
+        "rol": "consumidor",
+        "activo": True,
+        "fecha_registro": firestore.SERVER_TIMESTAMP
+    })
     return jsonify({
         "status": "ok",
-        "rol": "cliente",
-        "usuario": usuario
-    }), 200
+        "mensaje": "Cuenta de consumidor creada correctamente. Ya puedes iniciar sesión."
+    }), 201
 
 
 @app.route("/api/admin/aprobar_cliente", methods=["POST"])
@@ -211,7 +326,9 @@ def admin_cambiar_password():
 
     cliente_ref = db.collection("clientes").document(usuario)
     if cliente_ref.get().exists and nuevo_password:
-        cliente_ref.update({"password": nuevo_password})
+        if len(nuevo_password) < 6:
+            return jsonify({"status": "error", "mensaje": "La contraseña debe tener al menos 6 caracteres."}), 400
+        cliente_ref.update({"password": _crear_hash_password(nuevo_password)})
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
 
@@ -229,18 +346,40 @@ def cliente_cambiar_password():
         return jsonify({"status": "error"}), 404
 
     cliente = cliente_doc.to_dict() or {}
-    if cliente.get("password") != password_actual:
+    if not _verificar_password(cliente.get("password", ""), password_actual):
         return jsonify({"status": "error", "mensaje": "Contraseña incorrecta"}), 401
-    if not nuevo_password:
-        return jsonify({"status": "error", "mensaje": "Falta la nueva contraseña"}), 400
+    if len(nuevo_password) < 6:
+        return jsonify({"status": "error", "mensaje": "La nueva contraseña debe tener al menos 6 caracteres."}), 400
 
-    cliente_ref.update({"password": nuevo_password})
+    cliente_ref.update({"password": _crear_hash_password(nuevo_password)})
     return jsonify({"status": "ok"})
 
 
 @app.route("/api/cajas", methods=["GET"])
 def obtener_cajas():
     return jsonify(convertir_valores_para_json(obtener_cajas_db()))
+
+
+@app.route("/api/publico/maquinas", methods=["GET"])
+def obtener_maquinas_publicas():
+    """Catálogo público mínimo: nunca devuelve ganancias ni historial."""
+    maquinas = []
+    for doc in db.collection("cajas").stream():
+        datos = doc.to_dict() or {}
+        propietario = str(datos.get("propietario") or "sin_asignar")
+        tipo = str(datos.get("tipo") or "No asignado")
+        if datos.get("activo", True) is not True:
+            continue
+        if propietario == "sin_asignar" or tipo.lower() == "no asignado":
+            continue
+        maquinas.append({
+            "id": doc.id,
+            "nombre": str(datos.get("nombre") or "Máquina sin nombre"),
+            "tipo": tipo,
+            "conectado": _esp32_esta_conectado(datos)
+        })
+    maquinas.sort(key=lambda item: (item["tipo"].lower(), item["nombre"].lower()))
+    return jsonify({"maquinas": maquinas}), 200
 
 
 @app.route("/api/cajas/<id_caja>/historial", methods=["GET"])
