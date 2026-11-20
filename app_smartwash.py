@@ -420,7 +420,10 @@ def propietario_configurar_servicio(id_caja):
         return jsonify({"status": "error", "mensaje": "No se encontró la cuenta del propietario."}), 404
 
     cliente = cliente_doc.to_dict() or {}
-    if cliente.get("rol", "propietario") != "propietario":
+    # Compatibilidad con propietarios antiguos: algunos registros pueden no
+    # tener el campo "rol" o conservar el valor historico "cliente".
+    rol_cliente = str(cliente.get("rol") or "propietario").strip().lower()
+    if rol_cliente not in ("propietario", "cliente"):
         return jsonify({"status": "error", "mensaje": "Esta cuenta no corresponde a un propietario."}), 403
     if cliente.get("aprobado", False) is not True:
         return jsonify({"status": "error", "mensaje": "La cuenta todavía no está habilitada por TECSOL."}), 403
