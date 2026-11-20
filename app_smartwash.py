@@ -190,6 +190,9 @@ def registrar_cliente():
     db.collection("clientes").document(usuario).set({
         "password": _crear_hash_password(password),
         "rol": "propietario",
+        # Nombre inicial del local. El nombre comercial personalizado podrá
+        # mantenerse aquí en una actualización posterior autenticada.
+        "nombre_local": usuario,
         "aprobado": False
     })
     return jsonify({
@@ -362,23 +365,42 @@ def obtener_cajas():
 
 @app.route("/api/publico/maquinas", methods=["GET"])
 def obtener_maquinas_publicas():
-    """Catálogo público mínimo: nunca devuelve ganancias ni historial."""
+    """Catálogo público mínimo agrupable por local; no devuelve ganancias ni historial."""
     maquinas = []
+
+    # Se consulta la colección una sola vez para resolver el nombre público
+    # del local sin exponer contraseñas, hashes, teléfonos ni datos internos.
+    clientes = obtener_clientes_db()
+
     for doc in db.collection("cajas").stream():
         datos = doc.to_dict() or {}
         propietario = str(datos.get("propietario") or "sin_asignar")
         tipo = str(datos.get("tipo") or "No asignado")
         if datos.get("activo", True) is not True:
             continue
-        if propietario == "sin_asignar" or tipo.lower() == "no asignado":
+        if propietario == "sin_asignar" or tipo.strip().lower() == "no asignado":
             continue
+
+        perfil_propietario = clientes.get(propietario, {}) or {}
+        nombre_local = str(
+            perfil_propietario.get("nombre_local") or propietario
+        ).strip()
+
         maquinas.append({
             "id": doc.id,
             "nombre": str(datos.get("nombre") or "Máquina sin nombre"),
             "tipo": tipo,
+            "propietario": propietario,
+            "nombre_local": nombre_local or propietario,
             "conectado": _esp32_esta_conectado(datos)
         })
-    maquinas.sort(key=lambda item: (item["tipo"].lower(), item["nombre"].lower()))
+
+    maquinas.sort(key=lambda item: (
+        item["nombre_local"].lower(),
+        item["propietario"].lower(),
+        item["tipo"].lower(),
+        item["nombre"].lower()
+    ))
     return jsonify({"maquinas": maquinas}), 200
 
 
@@ -571,5 +593,6 @@ def ingresar_moneda():
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
 
 
