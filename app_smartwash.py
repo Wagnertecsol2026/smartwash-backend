@@ -10,6 +10,8 @@ import re
 import hashlib
 import hmac
 import secrets
+import base64
+import time
 
 app = Flask(__name__)
 
@@ -43,6 +45,70 @@ db = firestore.client()
 
 ADMIN_MASTER_USER = os.environ.get("ADMIN_MASTER_USER", "admin")
 ADMIN_MASTER_PASS = os.environ.get("ADMIN_MASTER_PASS", "")
+
+# Tokens de sesión de administrador para las nuevas funciones de gestión.
+# Se recomienda definir ADMIN_SESSION_SECRET en Render; como transición,
+# se deriva una clave del secreto de administrador ya existente.
+ADMIN_SESSION_SECRET = (
+    os.environ.get("ADMIN_SESSION_SECRET")
+    or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
+)
+ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
+
+
+def _b64url_encode(valor):
+    return base64.urlsafe_b64encode(valor).decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(valor):
+    relleno = "=" * (-len(valor) % 4)
+    return base64.urlsafe_b64decode((valor + relleno).encode("utf-8"))
+
+
+def _crear_token_admin(usuario):
+    """Crea un token firmado y temporal para las operaciones administrativas nuevas."""
+    if not ADMIN_SESSION_SECRET:
+        return None
+    ahora = int(time.time())
+    payload = f"{usuario}|{ahora}|{ahora + ADMIN_SESSION_TTL_SECONDS}|{secrets.token_urlsafe(12)}"
+    payload_codificado = _b64url_encode(payload.encode("utf-8"))
+    firma = hmac.new(
+        ADMIN_SESSION_SECRET.encode("utf-8"),
+        payload_codificado.encode("ascii"),
+        hashlib.sha256
+    ).digest()
+    return f"{payload_codificado}.{_b64url_encode(firma)}"
+
+
+def _admin_autorizado():
+    """Valida el token firmado de administrador enviado en Authorization: Bearer."""
+    encabezado = request.headers.get("Authorization", "")
+    if not encabezado.startswith("Bearer ") or not ADMIN_SESSION_SECRET:
+        return False
+    token = encabezado[7:].strip()
+    try:
+        payload_codificado, firma_recibida = token.split(".", 1)
+        firma_esperada = hmac.new(
+            ADMIN_SESSION_SECRET.encode("utf-8"),
+            payload_codificado.encode("ascii"),
+            hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(_b64url_decode(firma_recibida), firma_esperada):
+            return False
+        usuario, emitido_texto, expira_texto, _nonce = _b64url_decode(
+            payload_codificado
+        ).decode("utf-8").split("|", 3)
+        emitido = int(emitido_texto)
+        expira = int(expira_texto)
+        ahora = int(time.time())
+        return (
+            usuario == ADMIN_MASTER_USER
+            and emitido <= ahora + 60
+            and expira > ahora
+            and expira - emitido <= ADMIN_SESSION_TTL_SECONDS
+        )
+    except (ValueError, TypeError, UnicodeDecodeError, base64.binascii.Error):
+        return False
 
 # Un ESP32 se considera conectado si envio heartbeat en los ultimos 150 segundos.
 ESP32_ONLINE_TIMEOUT_SECONDS = 150
@@ -222,9 +288,18 @@ def login():
         if password != ADMIN_MASTER_PASS:
             return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
 
+        token_admin = _crear_token_admin(usuario)
+        if not token_admin:
+            app.logger.error("No se pudo generar el token de administrador")
+            return jsonify({
+                "status": "error",
+                "mensaje": "La sesión administrativa no está configurada en el servidor."
+            }), 503
+
         return jsonify({
             "status": "ok",
             "rol": "admin",
+            "token_admin": token_admin,
             "clientes": obtener_clientes_para_admin()
         }), 200
 
@@ -334,6 +409,124 @@ def admin_cambiar_password():
         cliente_ref.update({"password": _crear_hash_password(nuevo_password)})
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
+
+
+# --- GESTIÓN DE ESTACIONES FÍSICAS (SOLO ADMIN TECSOL) ---
+@app.route("/api/admin/estaciones", methods=["GET"])
+def admin_listar_estaciones():
+    if not _admin_autorizado():
+        return jsonify({"status": "error", "mensaje": "Sesión administrativa inválida o vencida."}), 401
+
+    clientes = obtener_clientes_db()
+    estaciones = []
+    for doc in db.collection("estaciones").stream():
+        datos = doc.to_dict() or {}
+        propietario = str(datos.get("propietario") or "")
+        perfil = clientes.get(propietario, {}) or {}
+        estaciones.append({
+            "id": doc.id,
+            "nombre": str(datos.get("nombre") or "Estación sin nombre"),
+            "propietario": propietario,
+            "nombre_local": str(perfil.get("nombre_local") or propietario),
+            "activo": datos.get("activo", True) is True,
+            "fecha_creacion": datos.get("fecha_creacion")
+        })
+
+    estaciones.sort(key=lambda item: (
+        item["nombre_local"].lower(), item["nombre"].lower()
+    ))
+    return jsonify({"status": "ok", "estaciones": convertir_valores_para_json(estaciones)}), 200
+
+
+@app.route("/api/admin/estaciones", methods=["POST"])
+def admin_crear_estacion():
+    if not _admin_autorizado():
+        return jsonify({"status": "error", "mensaje": "Sesión administrativa inválida o vencida."}), 401
+
+    datos = request.get_json(silent=True) or {}
+    nombre = re.sub(r"\s+", " ", str(datos.get("nombre") or "").strip())
+    propietario = str(datos.get("propietario") or "").strip()
+
+    if len(nombre) < 2 or len(nombre) > 50:
+        return jsonify({"status": "error", "mensaje": "El nombre de la estación debe tener entre 2 y 50 caracteres."}), 400
+    if not propietario:
+        return jsonify({"status": "error", "mensaje": "Selecciona el propietario de esta estación."}), 400
+
+    propietario_ref = db.collection("clientes").document(propietario)
+    propietario_doc = propietario_ref.get()
+    if not propietario_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró el propietario seleccionado."}), 404
+
+    perfil = propietario_doc.to_dict() or {}
+    if perfil.get("aprobado", False) is not True:
+        return jsonify({"status": "error", "mensaje": "El propietario debe estar aprobado por TECSOL antes de crear estaciones."}), 403
+
+    nombre_normalizado = nombre.casefold()
+    for doc in db.collection("estaciones").where("propietario", "==", propietario).stream():
+        existente = doc.to_dict() or {}
+        if str(existente.get("nombre") or "").strip().casefold() == nombre_normalizado:
+            return jsonify({"status": "error", "mensaje": "Ese propietario ya tiene una estación con ese nombre."}), 409
+
+    estacion_ref = db.collection("estaciones").document()
+    estacion_ref.set({
+        "nombre": nombre,
+        "propietario": propietario,
+        "activo": True,
+        "fecha_creacion": firestore.SERVER_TIMESTAMP,
+        "fecha_actualizacion": firestore.SERVER_TIMESTAMP
+    })
+
+    return jsonify({
+        "status": "ok",
+        "mensaje": "Estación creada correctamente.",
+        "estacion": {
+            "id": estacion_ref.id,
+            "nombre": nombre,
+            "propietario": propietario,
+            "nombre_local": str(perfil.get("nombre_local") or propietario),
+            "activo": True
+        }
+    }), 201
+
+
+@app.route("/api/admin/estaciones/<id_estacion>", methods=["PUT"])
+def admin_actualizar_estacion(id_estacion):
+    if not _admin_autorizado():
+        return jsonify({"status": "error", "mensaje": "Sesión administrativa inválida o vencida."}), 401
+
+    datos = request.get_json(silent=True) or {}
+    estacion_ref = db.collection("estaciones").document(id_estacion)
+    estacion_doc = estacion_ref.get()
+    if not estacion_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró la estación."}), 404
+
+    actual = estacion_doc.to_dict() or {}
+    propietario = str(actual.get("propietario") or "")
+    cambios = {}
+
+    if "nombre" in datos:
+        nombre = re.sub(r"\s+", " ", str(datos.get("nombre") or "").strip())
+        if len(nombre) < 2 or len(nombre) > 50:
+            return jsonify({"status": "error", "mensaje": "El nombre debe tener entre 2 y 50 caracteres."}), 400
+        for doc in db.collection("estaciones").where("propietario", "==", propietario).stream():
+            if doc.id == id_estacion:
+                continue
+            existente = doc.to_dict() or {}
+            if str(existente.get("nombre") or "").strip().casefold() == nombre.casefold():
+                return jsonify({"status": "error", "mensaje": "Ese propietario ya tiene otra estación con ese nombre."}), 409
+        cambios["nombre"] = nombre
+
+    if "activo" in datos:
+        if not isinstance(datos.get("activo"), bool):
+            return jsonify({"status": "error", "mensaje": "El estado de la estación no es válido."}), 400
+        cambios["activo"] = datos["activo"]
+
+    if not cambios:
+        return jsonify({"status": "error", "mensaje": "No se recibieron cambios para guardar."}), 400
+
+    cambios["fecha_actualizacion"] = firestore.SERVER_TIMESTAMP
+    estacion_ref.update(cambios)
+    return jsonify({"status": "ok", "mensaje": "Estación actualizada correctamente."}), 200
 
 
 @app.route("/api/propietario/actualizar_nombre_local", methods=["POST"])
@@ -723,6 +916,7 @@ def ingresar_moneda():
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
 
 
 
