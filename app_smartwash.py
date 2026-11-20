@@ -362,7 +362,10 @@ def propietario_actualizar_nombre_local():
         return jsonify({"status": "error", "mensaje": "No se encontró la cuenta del propietario."}), 404
 
     cliente = cliente_doc.to_dict() or {}
-    if cliente.get("rol", "propietario") != "propietario":
+    # Los registros antiguos de la colección "clientes" pueden no tener rol
+    # o conservar el rol histórico "cliente"; ambos representan propietarios.
+    rol_cliente = str(cliente.get("rol") or "propietario").strip().lower()
+    if rol_cliente not in ("propietario", "cliente"):
         return jsonify({"status": "error", "mensaje": "Esta cuenta no corresponde a un propietario."}), 403
     if cliente.get("aprobado", False) is not True:
         return jsonify({"status": "error", "mensaje": "La cuenta todavía no está habilitada por TECSOL."}), 403
@@ -381,6 +384,75 @@ def propietario_actualizar_nombre_local():
         "status": "ok",
         "mensaje": "El nombre comercial se actualizó correctamente.",
         "nombre_local": nombre_local
+    }), 200
+
+
+@app.route("/api/propietario/maquinas/<id_caja>/configurar_servicio", methods=["POST"])
+def propietario_configurar_servicio(id_caja):
+    """Permite al propietario configurar segundos de servicio por cada S/1.00."""
+    datos = request.get_json(silent=True) or {}
+    usuario = str(datos.get("usuario") or "").strip()
+    password_actual = str(datos.get("password_actual") or "")
+
+    try:
+        segundos_por_sol = int(datos.get("segundos_por_sol"))
+    except (TypeError, ValueError):
+        return jsonify({
+            "status": "error",
+            "mensaje": "Indica un tiempo válido en segundos por cada S/1.00."
+        }), 400
+
+    if not usuario or not password_actual:
+        return jsonify({
+            "status": "error",
+            "mensaje": "Se requiere la cuenta del propietario y su contraseña actual."
+        }), 400
+
+    if not 1 <= segundos_por_sol <= 3600:
+        return jsonify({
+            "status": "error",
+            "mensaje": "El tiempo debe estar entre 1 y 3600 segundos por cada S/1.00."
+        }), 400
+
+    cliente_ref = db.collection("clientes").document(usuario)
+    cliente_doc = cliente_ref.get()
+    if not cliente_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró la cuenta del propietario."}), 404
+
+    cliente = cliente_doc.to_dict() or {}
+    if cliente.get("rol", "propietario") != "propietario":
+        return jsonify({"status": "error", "mensaje": "Esta cuenta no corresponde a un propietario."}), 403
+    if cliente.get("aprobado", False) is not True:
+        return jsonify({"status": "error", "mensaje": "La cuenta todavía no está habilitada por TECSOL."}), 403
+
+    password_guardada = cliente.get("password", "")
+    if not _verificar_password(password_guardada, password_actual):
+        return jsonify({"status": "error", "mensaje": "La contraseña actual es incorrecta."}), 401
+
+    caja_ref = db.collection("cajas").document(id_caja)
+    caja_doc = caja_ref.get()
+    if not caja_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró la máquina."}), 404
+
+    caja = caja_doc.to_dict() or {}
+    if str(caja.get("propietario") or "") != usuario:
+        return jsonify({"status": "error", "mensaje": "No puedes configurar una máquina que no pertenece a tu local."}), 403
+
+    _migrar_password_si_antigua(cliente_ref, password_guardada)
+    if rol_cliente != "propietario":
+        cliente_ref.update({"rol": "propietario"})
+    caja_ref.update({
+        "segundos_por_sol": segundos_por_sol,
+        "servicio_configurado": True,
+        "servicio_actualizado": firestore.SERVER_TIMESTAMP
+    })
+    emitir_actualizacion_cajas()
+
+    return jsonify({
+        "status": "ok",
+        "mensaje": "La configuración del servicio se guardó correctamente.",
+        "id_caja": id_caja,
+        "segundos_por_sol": segundos_por_sol
     }), 200
 
 
@@ -434,13 +506,20 @@ def obtener_maquinas_publicas():
             perfil_propietario.get("nombre_local") or propietario
         ).strip()
 
+        try:
+            segundos_por_sol = int(datos.get("segundos_por_sol") or 0)
+        except (TypeError, ValueError):
+            segundos_por_sol = 0
+
         maquinas.append({
             "id": doc.id,
             "nombre": str(datos.get("nombre") or "Máquina sin nombre"),
             "tipo": tipo,
             "propietario": propietario,
             "nombre_local": nombre_local or propietario,
-            "conectado": _esp32_esta_conectado(datos)
+            "conectado": _esp32_esta_conectado(datos),
+            "segundos_por_sol": segundos_por_sol,
+            "servicio_configurado": 1 <= segundos_por_sol <= 3600
         })
 
     maquinas.sort(key=lambda item: (
