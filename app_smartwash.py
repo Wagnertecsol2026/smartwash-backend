@@ -190,8 +190,8 @@ def registrar_cliente():
     db.collection("clientes").document(usuario).set({
         "password": _crear_hash_password(password),
         "rol": "propietario",
-        # Nombre inicial del local. El nombre comercial personalizado podrá
-        # mantenerse aquí en una actualización posterior autenticada.
+        # Nombre inicial del local; el propietario puede cambiarlo desde
+        # su panel mediante la ruta que verifica su contraseña actual.
         "nombre_local": usuario,
         "aprobado": False
     })
@@ -334,6 +334,54 @@ def admin_cambiar_password():
         cliente_ref.update({"password": _crear_hash_password(nuevo_password)})
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 404
+
+
+@app.route("/api/propietario/actualizar_nombre_local", methods=["POST"])
+def propietario_actualizar_nombre_local():
+    """Actualiza el nombre comercial tras verificar las credenciales del propietario."""
+    datos = request.get_json(silent=True) or {}
+    usuario = str(datos.get("usuario") or "").strip()
+    password_actual = str(datos.get("password_actual") or "")
+    nombre_local = str(datos.get("nombre_local") or "").strip()
+
+    if not usuario or not password_actual or not nombre_local:
+        return jsonify({
+            "status": "error",
+            "mensaje": "Completa el nombre comercial y tu contraseña actual."
+        }), 400
+
+    if len(nombre_local) < 2 or len(nombre_local) > 60:
+        return jsonify({
+            "status": "error",
+            "mensaje": "El nombre comercial debe tener entre 2 y 60 caracteres."
+        }), 400
+
+    cliente_ref = db.collection("clientes").document(usuario)
+    cliente_doc = cliente_ref.get()
+    if not cliente_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró la cuenta del propietario."}), 404
+
+    cliente = cliente_doc.to_dict() or {}
+    if cliente.get("rol", "propietario") != "propietario":
+        return jsonify({"status": "error", "mensaje": "Esta cuenta no corresponde a un propietario."}), 403
+    if cliente.get("aprobado", False) is not True:
+        return jsonify({"status": "error", "mensaje": "La cuenta todavía no está habilitada por TECSOL."}), 403
+
+    password_guardada = cliente.get("password", "")
+    if not _verificar_password(password_guardada, password_actual):
+        return jsonify({"status": "error", "mensaje": "La contraseña actual es incorrecta."}), 401
+
+    _migrar_password_si_antigua(cliente_ref, password_guardada)
+    cliente_ref.update({
+        "nombre_local": nombre_local,
+        "nombre_local_actualizado": firestore.SERVER_TIMESTAMP
+    })
+
+    return jsonify({
+        "status": "ok",
+        "mensaje": "El nombre comercial se actualizó correctamente.",
+        "nombre_local": nombre_local
+    }), 200
 
 
 @app.route("/api/cliente/cambiar_password", methods=["POST"])
