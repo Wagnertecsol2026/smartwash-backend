@@ -12,6 +12,7 @@ import hmac
 import secrets
 import base64
 import time
+from decimal import Decimal, InvalidOperation
 
 app = Flask(__name__)
 
@@ -54,6 +55,17 @@ ADMIN_SESSION_SECRET = (
     or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
 )
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
+# Sesiones independientes para consumidores. Se deriva del secreto de sesión
+# del servidor si no se define USER_SESSION_SECRET en Render.
+USER_SESSION_SECRET = (
+    os.environ.get("USER_SESSION_SECRET")
+    or (ADMIN_SESSION_SECRET + "|SMARTWASH_USER_SESSION_V1" if ADMIN_SESSION_SECRET else "")
+)
+USER_SESSION_TTL_SECONDS = 4 * 60 * 60
+
+# Rango inicial de créditos digitales permitido en la fase de preparación.
+CREDITO_MINIMO_SOLES = 1
+CREDITO_MAXIMO_SOLES = 3
 
 
 def _b64url_encode(valor):
@@ -109,6 +121,58 @@ def _admin_autorizado():
         )
     except (ValueError, TypeError, UnicodeDecodeError, base64.binascii.Error):
         return False
+
+
+def _crear_token_consumidor(usuario):
+    """Crea una sesión firmada y temporal para un consumidor autenticado."""
+    if not USER_SESSION_SECRET:
+        return None
+    ahora = int(time.time())
+    expira = ahora + USER_SESSION_TTL_SECONDS
+    payload = f"consumidor|{usuario}|{ahora}|{expira}|{secrets.token_urlsafe(12)}"
+    payload_codificado = _b64url_encode(payload.encode("utf-8"))
+    firma = hmac.new(
+        USER_SESSION_SECRET.encode("utf-8"),
+        payload_codificado.encode("ascii"),
+        hashlib.sha256
+    ).digest()
+    return f"{payload_codificado}.{_b64url_encode(firma)}"
+
+
+def _consumidor_autorizado():
+    """Valida el token de consumidor y devuelve su usuario; None si no es válido."""
+    encabezado = request.headers.get("Authorization", "")
+    if not encabezado.startswith("Bearer ") or not USER_SESSION_SECRET:
+        return None
+    token = encabezado[7:].strip()
+    try:
+        payload_codificado, firma_recibida = token.split(".", 1)
+        firma_esperada = hmac.new(
+            USER_SESSION_SECRET.encode("utf-8"),
+            payload_codificado.encode("ascii"),
+            hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(_b64url_decode(firma_recibida), firma_esperada):
+            return None
+        rol, usuario, emitido_texto, expira_texto, _nonce = _b64url_decode(
+            payload_codificado
+        ).decode("utf-8").split("|", 4)
+        emitido = int(emitido_texto)
+        expira = int(expira_texto)
+        ahora = int(time.time())
+        if (rol != "consumidor" or not usuario or emitido > ahora + 60
+                or expira <= ahora or expira - emitido > USER_SESSION_TTL_SECONDS):
+            return None
+        consumidor_doc = db.collection("consumidores").document(usuario).get()
+        if not consumidor_doc.exists:
+            return None
+        consumidor = consumidor_doc.to_dict() or {}
+        if consumidor.get("activo", True) is not True:
+            return None
+        return usuario
+    except (ValueError, TypeError, UnicodeDecodeError, base64.binascii.Error):
+        return None
+
 
 # Un ESP32 se considera conectado si envio heartbeat en los ultimos 150 segundos.
 ESP32_ONLINE_TIMEOUT_SECONDS = 150
@@ -338,11 +402,19 @@ def login():
             return jsonify({"status": "error", "mensaje": "La cuenta se encuentra desactivada."}), 403
 
         _migrar_password_si_antigua(consumidor_ref, password_guardada)
+        token_consumidor = _crear_token_consumidor(usuario)
+        if not token_consumidor:
+            app.logger.error("No se pudo generar el token de sesión del consumidor.")
+            return jsonify({
+                "status": "error",
+                "mensaje": "La sesión del consumidor no está configurada en el servidor."
+            }), 503
         return jsonify({
             "status": "ok",
             "rol": "consumidor",
             "usuario": usuario,
-            "nombre": consumidor.get("nombre") or usuario
+            "nombre": consumidor.get("nombre") or usuario,
+            "token_consumidor": token_consumidor
         }), 200
 
     return jsonify({"status": "error", "mensaje": "Credenciales incorrectas"}), 401
@@ -834,6 +906,163 @@ def obtener_maquinas_publicas():
         item["nombre"].casefold()
     ))
     return jsonify({"maquinas": maquinas}), 200
+
+
+@app.route("/api/consumidor/ordenes", methods=["POST"])
+def consumidor_crear_orden_servicio():
+    """Registra la selección de un crédito sin cobrar ni activar la máquina.
+
+    El servidor vuelve a validar propietario, estación, licencia, heartbeat y
+    tiempo por sol directamente en Firestore. Los importes permitidos son S/1,
+    S/2 y S/3. La orden queda preparada para la futura integración de Yape.
+    """
+    usuario = _consumidor_autorizado()
+    if not usuario:
+        return jsonify({
+            "status": "error",
+            "mensaje": "Tu sesión venció o no es válida. Cierra sesión e ingresa nuevamente."
+        }), 401
+
+    datos = request.get_json(silent=True) or {}
+    id_caja = str(datos.get("id_caja") or "").strip()
+    request_id = str(datos.get("request_id") or "").strip()
+    importe_recibido = datos.get("importe")
+
+    if not id_caja:
+        return jsonify({"status": "error", "mensaje": "No se indicó la máquina seleccionada."}), 400
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", request_id):
+        return jsonify({"status": "error", "mensaje": "El identificador de selección no es válido."}), 400
+    if isinstance(importe_recibido, bool):
+        return jsonify({
+            "status": "error",
+            "mensaje": f"El importe debe ser un número entero entre S/ {CREDITO_MINIMO_SOLES}.00 y S/ {CREDITO_MAXIMO_SOLES}.00."
+        }), 400
+    try:
+        importe_decimal = Decimal(str(importe_recibido))
+    except (InvalidOperation, ValueError, TypeError):
+        return jsonify({"status": "error", "mensaje": "El importe seleccionado no es válido."}), 400
+    if (not importe_decimal.is_finite()
+            or importe_decimal != importe_decimal.to_integral_value()
+            or importe_decimal < CREDITO_MINIMO_SOLES
+            or importe_decimal > CREDITO_MAXIMO_SOLES):
+        return jsonify({
+            "status": "error",
+            "mensaje": f"Por ahora solo puedes seleccionar importes enteros entre S/ {CREDITO_MINIMO_SOLES}.00 y S/ {CREDITO_MAXIMO_SOLES}.00."
+        }), 400
+    importe = int(importe_decimal)
+
+    consumidor_ref = db.collection("consumidores").document(usuario)
+    consumidor_doc = consumidor_ref.get()
+    if not consumidor_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró la cuenta del consumidor."}), 404
+    consumidor = consumidor_doc.to_dict() or {}
+    if consumidor.get("activo", True) is not True:
+        return jsonify({"status": "error", "mensaje": "La cuenta de consumidor está desactivada."}), 403
+
+    caja_ref = db.collection("cajas").document(id_caja)
+    caja_doc = caja_ref.get()
+    if not caja_doc.exists:
+        return jsonify({"status": "error", "mensaje": "La máquina seleccionada ya no existe."}), 404
+    caja = caja_doc.to_dict() or {}
+
+    if caja.get("activo", True) is not True:
+        return jsonify({"status": "error", "mensaje": "La máquina tiene la licencia suspendida y no está disponible."}), 409
+
+    propietario = str(caja.get("propietario") or "").strip()
+    estacion_id = str(caja.get("estacion_id") or "").strip()
+    tipo_servicio = str(caja.get("tipo") or "No asignado").strip()
+    if not propietario or propietario == "sin_asignar" or not estacion_id:
+        return jsonify({"status": "error", "mensaje": "La máquina no tiene propietario y estación correctamente asignados."}), 409
+    if tipo_servicio.casefold() == "no asignado":
+        return jsonify({"status": "error", "mensaje": "La máquina todavía no tiene un servicio configurado."}), 409
+
+    propietario_doc = db.collection("clientes").document(propietario).get()
+    if not propietario_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró el propietario de la máquina."}), 409
+    perfil_propietario = propietario_doc.to_dict() or {}
+    if perfil_propietario.get("aprobado", False) is not True:
+        return jsonify({"status": "error", "mensaje": "El establecimiento no está habilitado por TECSOL."}), 409
+
+    estacion_doc = db.collection("estaciones").document(estacion_id).get()
+    if not estacion_doc.exists:
+        return jsonify({"status": "error", "mensaje": "La estación asignada ya no existe."}), 409
+    estacion = estacion_doc.to_dict() or {}
+    if (estacion.get("activo", True) is not True
+            or str(estacion.get("propietario") or "").strip() != propietario):
+        return jsonify({"status": "error", "mensaje": "La estación está deshabilitada o no pertenece a este propietario."}), 409
+
+    if not _esp32_esta_conectado(caja):
+        return jsonify({"status": "error", "mensaje": "La máquina perdió comunicación con su ESP32. Actualiza el catálogo e inténtalo nuevamente."}), 409
+
+    try:
+        segundos_por_sol = int(caja.get("segundos_por_sol") or 0)
+    except (TypeError, ValueError):
+        segundos_por_sol = 0
+    if not 1 <= segundos_por_sol <= 3600:
+        return jsonify({"status": "error", "mensaje": "El propietario todavía no ha configurado el tiempo de este servicio."}), 409
+
+    duracion_segundos = segundos_por_sol * importe
+    nombre_local = str(perfil_propietario.get("nombre_local") or propietario).strip() or propietario
+    nombre_estacion = str(estacion.get("nombre") or caja.get("estacion_nombre") or "Estación").strip()
+    nombre_maquina = str(caja.get("nombre") or "Máquina sin nombre").strip()
+
+    # El ID determinista por consumidor y request_id hace que repetir el POST
+    # no cree varias órdenes para un mismo toque del botón.
+    orden_id = hashlib.sha256(f"{usuario}|{request_id}".encode("utf-8")).hexdigest()
+    orden_ref = db.collection("ordenes_servicio").document(orden_id)
+    orden_existente = orden_ref.get()
+    if orden_existente.exists:
+        anterior = orden_existente.to_dict() or {}
+        if (anterior.get("consumidor") != usuario
+                or anterior.get("id_caja") != id_caja
+                or anterior.get("importe") != importe):
+            return jsonify({"status": "error", "mensaje": "El identificador de selección ya fue utilizado para otra operación."}), 409
+        return jsonify({
+            "status": "ok",
+            "mensaje": "La selección ya estaba registrada.",
+            "orden_id": orden_id,
+            "importe": anterior.get("importe"),
+            "duracion_segundos": anterior.get("duracion_segundos"),
+            "estado": anterior.get("estado", "seleccion_confirmada"),
+            "repetida": True
+        }), 200
+
+    vence_en = datetime.now(timezone.utc) + timedelta(minutes=10)
+    orden_ref.set({
+        "orden_id": orden_id,
+        "request_id": request_id,
+        "consumidor": usuario,
+        "nombre_consumidor": str(consumidor.get("nombre") or usuario),
+        "propietario": propietario,
+        "nombre_local": nombre_local,
+        "estacion_id": estacion_id,
+        "estacion_nombre": nombre_estacion,
+        "id_caja": id_caja,
+        "nombre_maquina": nombre_maquina,
+        "tipo_servicio": tipo_servicio,
+        "importe": importe,
+        "segundos_por_sol": segundos_por_sol,
+        "duracion_segundos": duracion_segundos,
+        "estado": "seleccion_confirmada",
+        "pago_estado": "no_iniciado",
+        "activacion_autorizada": False,
+        "activacion_enviada": False,
+        "creado_en": firestore.SERVER_TIMESTAMP,
+        "vence_en": vence_en
+    })
+
+    return jsonify({
+        "status": "ok",
+        "mensaje": "La selección fue registrada. Todavía no se ha realizado ningún pago.",
+        "orden_id": orden_id,
+        "importe": importe,
+        "segundos_por_sol": segundos_por_sol,
+        "duracion_segundos": duracion_segundos,
+        "estado": "seleccion_confirmada",
+        "pago_estado": "no_iniciado",
+        "vence_en": vence_en.isoformat(),
+        "repetida": False
+    }), 201
 
 
 @app.route("/api/cajas/<id_caja>/historial", methods=["GET"])
