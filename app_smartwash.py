@@ -50,8 +50,8 @@ ADMIN_MASTER_PASS = os.environ.get("ADMIN_MASTER_PASS", "")
 # Se recomienda definir ADMIN_SESSION_SECRET en Render; como transición,
 # se deriva una clave del secreto de administrador ya existente.
 ADMIN_SESSION_SECRET = (
-        os.environ.get("ADMIN_SESSION_SECRET")
-        or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
+    os.environ.get("ADMIN_SESSION_SECRET")
+    or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
 )
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 
@@ -102,10 +102,10 @@ def _admin_autorizado():
         expira = int(expira_texto)
         ahora = int(time.time())
         return (
-                usuario == ADMIN_MASTER_USER
-                and emitido <= ahora + 60
-                and expira > ahora
-                and expira - emitido <= ADMIN_SESSION_TTL_SECONDS
+            usuario == ADMIN_MASTER_USER
+            and emitido <= ahora + 60
+            and expira > ahora
+            and expira - emitido <= ADMIN_SESSION_TTL_SECONDS
         )
     except (ValueError, TypeError, UnicodeDecodeError, base64.binascii.Error):
         return False
@@ -760,26 +760,53 @@ def obtener_cajas():
 
 @app.route("/api/publico/maquinas", methods=["GET"])
 def obtener_maquinas_publicas():
-    """Catálogo público mínimo agrupable por local; no devuelve ganancias ni historial."""
-    maquinas = []
+    """Catálogo público agrupable por autolavado, estación y máquina.
 
-    # Se consulta la colección una sola vez para resolver el nombre público
-    # del local sin exponer contraseñas, hashes, teléfonos ni datos internos.
+    Solo devuelve máquinas habilitadas, asignadas a un propietario y vinculadas
+    a una estación activa del mismo propietario. No expone ganancias, historial,
+    contraseñas, hashes ni datos privados de los perfiles.
+    """
+    maquinas = []
     clientes = obtener_clientes_db()
+
+    # Índice de estaciones activas para resolver la relación sin hacer una
+    # consulta adicional por cada máquina.
+    estaciones_activas = {}
+    for estacion_doc in db.collection("estaciones").stream():
+        estacion_datos = estacion_doc.to_dict() or {}
+        if estacion_datos.get("activo", True) is not True:
+            continue
+        estaciones_activas[estacion_doc.id] = estacion_datos
 
     for doc in db.collection("cajas").stream():
         datos = doc.to_dict() or {}
-        propietario = str(datos.get("propietario") or "sin_asignar")
-        tipo = str(datos.get("tipo") or "No asignado")
+        propietario = str(datos.get("propietario") or "sin_asignar").strip()
+        tipo = str(datos.get("tipo") or "No asignado").strip()
+        estacion_id = str(datos.get("estacion_id") or "").strip()
+
+        # No exponer máquinas suspendidas, no asignadas o sin estación física.
         if datos.get("activo", True) is not True:
             continue
-        if propietario == "sin_asignar" or tipo.strip().lower() == "no asignado":
+        if propietario == "sin_asignar" or tipo.lower() == "no asignado":
+            continue
+        if not estacion_id:
             continue
 
-        perfil_propietario = clientes.get(propietario, {}) or {}
+        perfil_propietario = clientes.get(propietario)
+        if not isinstance(perfil_propietario, dict) or perfil_propietario.get("aprobado", False) is not True:
+            continue
+
+        estacion = estaciones_activas.get(estacion_id)
+        if not isinstance(estacion, dict):
+            continue
+        if str(estacion.get("propietario") or "").strip() != propietario:
+            # Evita que un error de configuración mezcle estaciones de distintos dueños.
+            continue
+
         nombre_local = str(
             perfil_propietario.get("nombre_local") or propietario
-        ).strip()
+        ).strip() or propietario
+        nombre_estacion = str(estacion.get("nombre") or "Estación sin nombre").strip()
 
         try:
             segundos_por_sol = int(datos.get("segundos_por_sol") or 0)
@@ -791,17 +818,20 @@ def obtener_maquinas_publicas():
             "nombre": str(datos.get("nombre") or "Máquina sin nombre"),
             "tipo": tipo,
             "propietario": propietario,
-            "nombre_local": nombre_local or propietario,
+            "nombre_local": nombre_local,
+            "estacion_id": estacion_id,
+            "estacion_nombre": nombre_estacion,
             "conectado": _esp32_esta_conectado(datos),
             "segundos_por_sol": segundos_por_sol,
             "servicio_configurado": 1 <= segundos_por_sol <= 3600
         })
 
     maquinas.sort(key=lambda item: (
-        item["nombre_local"].lower(),
-        item["propietario"].lower(),
-        item["tipo"].lower(),
-        item["nombre"].lower()
+        item["nombre_local"].casefold(),
+        item["propietario"].casefold(),
+        item["estacion_nombre"].casefold(),
+        item["tipo"].casefold(),
+        item["nombre"].casefold()
     ))
     return jsonify({"maquinas": maquinas}), 200
 
@@ -995,6 +1025,7 @@ def ingresar_moneda():
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
 
 
 
