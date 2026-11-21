@@ -50,8 +50,8 @@ ADMIN_MASTER_PASS = os.environ.get("ADMIN_MASTER_PASS", "")
 # Se recomienda definir ADMIN_SESSION_SECRET en Render; como transición,
 # se deriva una clave del secreto de administrador ya existente.
 ADMIN_SESSION_SECRET = (
-    os.environ.get("ADMIN_SESSION_SECRET")
-    or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
+        os.environ.get("ADMIN_SESSION_SECRET")
+        or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
 )
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 
@@ -102,10 +102,10 @@ def _admin_autorizado():
         expira = int(expira_texto)
         ahora = int(time.time())
         return (
-            usuario == ADMIN_MASTER_USER
-            and emitido <= ahora + 60
-            and expira > ahora
-            and expira - emitido <= ADMIN_SESSION_TTL_SECONDS
+                usuario == ADMIN_MASTER_USER
+                and emitido <= ahora + 60
+                and expira > ahora
+                and expira - emitido <= ADMIN_SESSION_TTL_SECONDS
         )
     except (ValueError, TypeError, UnicodeDecodeError, base64.binascii.Error):
         return False
@@ -529,6 +529,85 @@ def admin_actualizar_estacion(id_estacion):
     return jsonify({"status": "ok", "mensaje": "Estación actualizada correctamente."}), 200
 
 
+@app.route("/api/admin/cajas/<id_caja>/configuracion", methods=["PUT"])
+def admin_configurar_caja(id_caja):
+    """Actualiza los datos administrativos de una máquina y su estación en una sola operación."""
+    if not _admin_autorizado():
+        return jsonify({"status": "error", "mensaje": "Sesión administrativa inválida o vencida. Vuelve a ingresar."}), 401
+
+    datos = request.get_json(silent=True) or {}
+    nombre = re.sub(r"\s+", " ", str(datos.get("nombre") or "").strip())
+    tipo = str(datos.get("tipo") or "").strip()
+    propietario = str(datos.get("propietario") or "sin_asignar").strip()
+    estacion_id = str(datos.get("estacion_id") or "").strip()
+    activo = datos.get("activo", True)
+
+    if len(nombre) < 1 or len(nombre) > 60:
+        return jsonify({"status": "error", "mensaje": "El nombre de la máquina debe tener entre 1 y 60 caracteres."}), 400
+    tipos_validos = {"Agua", "Shampoo", "Silicona", "Aspiradora", "No asignado"}
+    if tipo not in tipos_validos:
+        return jsonify({"status": "error", "mensaje": "El tipo de servicio seleccionado no es válido."}), 400
+    if not isinstance(activo, bool):
+        return jsonify({"status": "error", "mensaje": "El estado de la licencia no es válido."}), 400
+
+    caja_ref = db.collection("cajas").document(id_caja)
+    caja_doc = caja_ref.get()
+    if not caja_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No se encontró la máquina seleccionada."}), 404
+    caja_actual = caja_doc.to_dict() or {}
+
+    if propietario != "sin_asignar":
+        propietario_doc = db.collection("clientes").document(propietario).get()
+        if not propietario_doc.exists:
+            return jsonify({"status": "error", "mensaje": "No se encontró el propietario seleccionado."}), 404
+
+    estacion_datos = None
+    if estacion_id:
+        if propietario == "sin_asignar":
+            return jsonify({"status": "error", "mensaje": "Primero asigna la máquina a un propietario para vincularla con una estación."}), 400
+
+        estacion_ref = db.collection("estaciones").document(estacion_id)
+        estacion_doc = estacion_ref.get()
+        if not estacion_doc.exists:
+            return jsonify({"status": "error", "mensaje": "La estación seleccionada ya no existe. Actualiza la lista e inténtalo nuevamente."}), 404
+
+        estacion_datos = estacion_doc.to_dict() or {}
+        if str(estacion_datos.get("propietario") or "") != propietario:
+            return jsonify({"status": "error", "mensaje": "La estación seleccionada no pertenece al propietario de esta máquina."}), 403
+        if (estacion_datos.get("activo", True) is not True
+                and str(caja_actual.get("estacion_id") or "") != estacion_id):
+            return jsonify({"status": "error", "mensaje": "La estación está deshabilitada. Actívala antes de asignar una máquina nueva."}), 409
+
+    # Solo se actualizan los campos de configuración. Se conservan ingresos,
+    # historial, heartbeat, MAC y segundos_por_sol.
+    cambios = {
+        "nombre": nombre,
+        "tipo": tipo,
+        "activo": activo,
+        "propietario": propietario,
+        "estado_registro": "asignada" if propietario != "sin_asignar" else "pendiente",
+        "fecha_actualizacion_configuracion": firestore.SERVER_TIMESTAMP,
+    }
+    if estacion_id:
+        cambios["estacion_id"] = estacion_id
+        cambios["estacion_nombre"] = str(estacion_datos.get("nombre") or "Estación")
+    else:
+        cambios["estacion_id"] = firestore.DELETE_FIELD
+        cambios["estacion_nombre"] = firestore.DELETE_FIELD
+
+    caja_ref.update(cambios)
+    emitir_actualizacion_cajas()
+
+    return jsonify({
+        "status": "ok",
+        "mensaje": "Máquina actualizada y estación vinculada correctamente." if estacion_id else "Máquina actualizada. Quedó sin estación asignada.",
+        "id_caja": id_caja,
+        "propietario": propietario,
+        "estacion_id": estacion_id or None,
+        "estacion_nombre": str(estacion_datos.get("nombre")) if estacion_datos else None,
+    }), 200
+
+
 @app.route("/api/propietario/actualizar_nombre_local", methods=["POST"])
 def propietario_actualizar_nombre_local():
     """Actualiza el nombre comercial tras verificar las credenciales del propietario."""
@@ -916,7 +995,6 @@ def ingresar_moneda():
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-
 
 
 
