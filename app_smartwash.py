@@ -4,7 +4,9 @@ from flask_socketio import SocketIO
 from datetime import datetime, timedelta, date, timezone
 import io
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import credentials, firestore
+import requests
+from urllib.parse import quote, urlparse
 import os
 import json
 import re
@@ -68,10 +70,16 @@ USER_SESSION_TTL_SECONDS = 4 * 60 * 60
 CREDITO_MINIMO_SOLES = 1
 CREDITO_MAXIMO_SOLES = 3
 
-# Configuración privada del QR personal de Yape por propietario.
-# El bucket se configura en Render mediante FIREBASE_STORAGE_BUCKET.
-FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+# Configuración privada del QR personal de Yape por propietario en Supabase Storage.
+# Estas variables se configuran exclusivamente en Render. La clave secreta
+# nunca debe enviarse a Flutter ni guardarse en el repositorio.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+SUPABASE_QR_BUCKET = os.environ.get(
+    "SUPABASE_QR_BUCKET", "smartwash-qr-propietarios"
+).strip()
 YAPE_QR_MAX_BYTES = 3 * 1024 * 1024  # 3 MB por imagen
+SUPABASE_STORAGE_TIMEOUT = (5, 30)
 
 
 def _b64url_encode(valor):
@@ -336,11 +344,97 @@ def _verificar_propietario_para_qr(usuario, password_actual):
     return propietario_ref, propietario, None
 
 
-def _obtener_bucket_qr_yape():
-    """Devuelve el bucket privado; no habilita acceso público a los objetos."""
-    if not FIREBASE_STORAGE_BUCKET:
-        raise RuntimeError("FIREBASE_STORAGE_BUCKET no está configurado en Render.")
-    return storage.bucket(FIREBASE_STORAGE_BUCKET)
+def _supabase_storage_configuracion():
+    """Valida que Render tenga las credenciales del almacenamiento Supabase."""
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY or not SUPABASE_QR_BUCKET:
+        raise RuntimeError(
+            "Faltan SUPABASE_URL, SUPABASE_SECRET_KEY o SUPABASE_QR_BUCKET en Render."
+        )
+    parsed = urlparse(SUPABASE_URL)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise RuntimeError("SUPABASE_URL debe ser una URL HTTPS válida del proyecto.")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,100}", SUPABASE_QR_BUCKET):
+        raise RuntimeError("SUPABASE_QR_BUCKET tiene un nombre no válido.")
+
+
+def _supabase_headers(content_type=None):
+    """Crea cabeceras servidor-a-servidor con la clave secreta de Supabase."""
+    _supabase_storage_configuracion()
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Accept": "application/json",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _supabase_storage_url(recurso):
+    return f"{SUPABASE_URL}/storage/v1/{recurso.lstrip('/')}"
+
+
+def _supabase_subir_qr(storage_path, contenido, content_type):
+    """Sube una imagen nueva al bucket privado sin sobrescribir archivos."""
+    ruta = quote(storage_path, safe="/")
+    headers = _supabase_headers(content_type)
+    headers["x-upsert"] = "false"
+    headers["cache-control"] = "0"
+    try:
+        response = requests.post(
+            _supabase_storage_url(f"object/{SUPABASE_QR_BUCKET}/{ruta}"),
+            headers=headers,
+            data=contenido,
+            timeout=SUPABASE_STORAGE_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError("No fue posible conectar con Supabase Storage.") from exc
+    if not response.ok:
+        detalle = (response.text or "")[:350]
+        raise RuntimeError(
+            f"Supabase Storage rechazó la carga (HTTP {response.status_code}): {detalle}"
+        )
+    return response
+
+
+def _supabase_descargar_qr(storage_path):
+    """Descarga un objeto privado; el archivo nunca se sirve desde una URL pública."""
+    ruta = quote(storage_path, safe="/")
+    try:
+        response = requests.get(
+            _supabase_storage_url(
+                f"object/authenticated/{SUPABASE_QR_BUCKET}/{ruta}"
+            ),
+            headers=_supabase_headers(),
+            timeout=SUPABASE_STORAGE_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError("No fue posible conectar con Supabase Storage.") from exc
+    if not response.ok:
+        detalle = (response.text or "")[:350]
+        raise RuntimeError(
+            f"Supabase Storage no pudo recuperar el QR (HTTP {response.status_code}): {detalle}"
+        )
+    return response.content
+
+
+def _supabase_eliminar_qr(storage_path):
+    """Elimina un único objeto antiguo del bucket privado."""
+    try:
+        response = requests.delete(
+            _supabase_storage_url(f"object/{SUPABASE_QR_BUCKET}"),
+            headers=_supabase_headers("application/json"),
+            json={"prefixes": [storage_path]},
+            timeout=SUPABASE_STORAGE_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError("No fue posible conectar con Supabase Storage.") from exc
+    if not response.ok:
+        detalle = (response.text or "")[:350]
+        raise RuntimeError(
+            f"Supabase Storage no pudo eliminar el archivo anterior (HTTP {response.status_code}): {detalle}"
+        )
+    return True
 
 
 def _detectar_tipo_imagen_qr(contenido):
@@ -823,17 +917,14 @@ def propietario_subir_qr_yape():
             "mensaje": "Formato no admitido. Utiliza una imagen PNG, JPG o WEBP."
         }), 415
 
+    storage_path = ""
     try:
-        bucket = _obtener_bucket_qr_yape()
         nombre_archivo = os.path.basename(str(archivo.filename or "qr_yape"))[:100]
-        storage_path = f"yape_qr/{usuario}/{secrets.token_hex(16)}.{extension}"
-        blob = bucket.blob(storage_path)
-        blob.cache_control = "private, no-store, max-age=0"
-        blob.metadata = {
-            "propietario": usuario,
-            "uso": "qr_yape_personal"
-        }
-        blob.upload_from_string(contenido, content_type=content_type)
+        # Cada nueva imagen recibe una ruta distinta. Así evitamos sobrescrituras
+        # y conservamos el QR anterior hasta que Firestore confirme el reemplazo.
+        usuario_ruta = quote(usuario, safe="")
+        storage_path = f"yape_qr/{usuario_ruta}/{secrets.token_hex(16)}.{extension}"
+        _supabase_subir_qr(storage_path, contenido, content_type)
 
         config_ref = db.collection("configuracion_yape").document(usuario)
         config_anterior_doc = config_ref.get()
@@ -844,6 +935,8 @@ def propietario_subir_qr_yape():
             config_ref.set({
                 "propietario": usuario,
                 "activo": True,
+                "storage_provider": "supabase",
+                "storage_bucket": SUPABASE_QR_BUCKET,
                 "storage_path": storage_path,
                 "nombre_archivo": nombre_archivo,
                 "content_type": content_type,
@@ -854,36 +947,37 @@ def propietario_subir_qr_yape():
             }, merge=True)
         except Exception:
             try:
-                blob.delete()
+                _supabase_eliminar_qr(storage_path)
             except Exception:
                 app.logger.exception("No se pudo limpiar un QR nuevo tras fallo al guardar Firestore.")
             raise
 
+        # El archivo anterior solo se elimina después de guardar la nueva ruta.
         if path_anterior and path_anterior != storage_path:
             try:
-                bucket.blob(path_anterior).delete()
+                _supabase_eliminar_qr(path_anterior)
             except Exception:
                 app.logger.exception("No se pudo eliminar el QR anterior del propietario %s.", usuario)
 
         return jsonify({
             "status": "ok",
-            "mensaje": "El QR se guardó correctamente. Los cobros siguen deshabilitados hasta completar la validación de Yape.",
+            "mensaje": "El QR se guardó correctamente en almacenamiento privado. Los cobros siguen deshabilitados hasta completar la validación de Yape.",
             "qr_configurado": True,
             "activo": True,
             "validacion": "pendiente",
             "habilitado_para_cobros": False
         }), 201
     except RuntimeError as e:
-        app.logger.error("Configuración de Storage incompleta: %s", str(e))
+        app.logger.error("Configuración de Supabase Storage incompleta o no disponible: %s", str(e))
         return jsonify({
             "status": "error",
-            "mensaje": "Firebase Storage no está configurado. Verifica el bucket en Render."
+            "mensaje": "Supabase Storage no está configurado o no pudo completar la operación. Verifica las variables de Render y el bucket privado."
         }), 503
     except Exception:
         app.logger.exception("Error al almacenar el QR de Yape del propietario %s.", usuario)
         return jsonify({
             "status": "error",
-            "mensaje": "No se pudo almacenar la imagen. Verifica Firebase Storage y vuelve a intentarlo."
+            "mensaje": "No se pudo almacenar la imagen en Supabase Storage. Revisa los registros del servidor."
         }), 503
 
 
@@ -906,9 +1000,7 @@ def propietario_previsualizar_qr_yape():
         return jsonify({"status": "error", "mensaje": "El QR de Yape está deshabilitado o no está disponible."}), 404
 
     try:
-        bucket = _obtener_bucket_qr_yape()
-        blob = bucket.blob(str(config["storage_path"]))
-        contenido = blob.download_as_bytes()
+        contenido = _supabase_descargar_qr(str(config["storage_path"]))
         content_type = str(config.get("content_type") or "image/png")
         response = send_file(
             io.BytesIO(contenido),
@@ -921,8 +1013,8 @@ def propietario_previsualizar_qr_yape():
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
     except RuntimeError as e:
-        app.logger.error("Configuración de Storage incompleta: %s", str(e))
-        return jsonify({"status": "error", "mensaje": "Firebase Storage no está configurado."}), 503
+        app.logger.error("Error de configuración o descarga de Supabase Storage: %s", str(e))
+        return jsonify({"status": "error", "mensaje": "Supabase Storage no está configurado o no pudo recuperar el QR."}), 503
     except Exception:
         app.logger.exception("Error al recuperar el QR privado del propietario %s.", usuario)
         return jsonify({"status": "error", "mensaje": "No se pudo cargar el QR guardado."}), 503
