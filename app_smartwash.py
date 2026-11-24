@@ -1,9 +1,10 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from datetime import datetime, timedelta, date, timezone
+import io
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage
 import os
 import json
 import re
@@ -51,21 +52,26 @@ ADMIN_MASTER_PASS = os.environ.get("ADMIN_MASTER_PASS", "")
 # Se recomienda definir ADMIN_SESSION_SECRET en Render; como transición,
 # se deriva una clave del secreto de administrador ya existente.
 ADMIN_SESSION_SECRET = (
-    os.environ.get("ADMIN_SESSION_SECRET")
-    or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
+        os.environ.get("ADMIN_SESSION_SECRET")
+        or (ADMIN_MASTER_PASS + "|SMARTWASH_ADMIN_SESSION_V1" if ADMIN_MASTER_PASS else "")
 )
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 # Sesiones independientes para consumidores. Se deriva del secreto de sesión
 # del servidor si no se define USER_SESSION_SECRET en Render.
 USER_SESSION_SECRET = (
-    os.environ.get("USER_SESSION_SECRET")
-    or (ADMIN_SESSION_SECRET + "|SMARTWASH_USER_SESSION_V1" if ADMIN_SESSION_SECRET else "")
+        os.environ.get("USER_SESSION_SECRET")
+        or (ADMIN_SESSION_SECRET + "|SMARTWASH_USER_SESSION_V1" if ADMIN_SESSION_SECRET else "")
 )
 USER_SESSION_TTL_SECONDS = 4 * 60 * 60
 
 # Rango inicial de créditos digitales permitido en la fase de preparación.
 CREDITO_MINIMO_SOLES = 1
 CREDITO_MAXIMO_SOLES = 3
+
+# Configuración privada del QR personal de Yape por propietario.
+# El bucket se configura en Render mediante FIREBASE_STORAGE_BUCKET.
+FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+YAPE_QR_MAX_BYTES = 3 * 1024 * 1024  # 3 MB por imagen
 
 
 def _b64url_encode(valor):
@@ -114,10 +120,10 @@ def _admin_autorizado():
         expira = int(expira_texto)
         ahora = int(time.time())
         return (
-            usuario == ADMIN_MASTER_USER
-            and emitido <= ahora + 60
-            and expira > ahora
-            and expira - emitido <= ADMIN_SESSION_TTL_SECONDS
+                usuario == ADMIN_MASTER_USER
+                and emitido <= ahora + 60
+                and expira > ahora
+                and expira - emitido <= ADMIN_SESSION_TTL_SECONDS
         )
     except (ValueError, TypeError, UnicodeDecodeError, base64.binascii.Error):
         return False
@@ -301,6 +307,53 @@ def emitir_actualizacion_cajas():
         )
 
 
+def _verificar_propietario_para_qr(usuario, password_actual):
+    """Comprueba cuenta, rol, aprobación TECSOL y contraseña para operaciones QR."""
+    usuario = str(usuario or "").strip()
+    password_actual = str(password_actual or "")
+    if not usuario or not password_actual:
+        return None, None, ("Se requiere el usuario y la contraseña actual del propietario.", 400)
+
+    propietario_ref = db.collection("clientes").document(usuario)
+    propietario_doc = propietario_ref.get()
+    if not propietario_doc.exists:
+        return None, None, ("No se encontró la cuenta del propietario.", 404)
+
+    propietario = propietario_doc.to_dict() or {}
+    rol = str(propietario.get("rol") or "propietario").strip().lower()
+    if rol not in ("propietario", "cliente"):
+        return None, None, ("Esta cuenta no corresponde a un propietario.", 403)
+    if propietario.get("aprobado", False) is not True:
+        return None, None, ("La cuenta todavía no está habilitada por TECSOL.", 403)
+
+    password_guardada = propietario.get("password", "")
+    if not _verificar_password(password_guardada, password_actual):
+        return None, None, ("La contraseña actual es incorrecta.", 401)
+
+    _migrar_password_si_antigua(propietario_ref, password_guardada)
+    if rol != "propietario":
+        propietario_ref.update({"rol": "propietario"})
+    return propietario_ref, propietario, None
+
+
+def _obtener_bucket_qr_yape():
+    """Devuelve el bucket privado; no habilita acceso público a los objetos."""
+    if not FIREBASE_STORAGE_BUCKET:
+        raise RuntimeError("FIREBASE_STORAGE_BUCKET no está configurado en Render.")
+    return storage.bucket(FIREBASE_STORAGE_BUCKET)
+
+
+def _detectar_tipo_imagen_qr(contenido):
+    """Acepta únicamente firmas binarias PNG, JPEG o WEBP; no confía en la extensión."""
+    if contenido.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if contenido.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if len(contenido) >= 12 and contenido[:4] == b"RIFF" and contenido[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None, None
+
+
 # --- RUTAS DE LA API ---
 
 @app.route("/api/registro", methods=["POST"])
@@ -383,11 +436,22 @@ def login():
                 "mensaje": "Cuenta pendiente de activación por TECSOL."
             }), 403
 
+        config_qr_doc = db.collection("configuracion_yape").document(usuario).get()
+        if config_qr_doc.exists:
+            config_qr = config_qr_doc.to_dict() or {}
+        else:
+            config_qr = {}
+        qr_configurado = (
+            config_qr.get("activo", False) is True
+            and bool(config_qr.get("storage_path"))
+        )
+
         return jsonify({
             "status": "ok",
             "rol": "propietario",
             "usuario": usuario,
-            "nombre_local": cliente.get("nombre_local") or usuario
+            "nombre_local": cliente.get("nombre_local") or usuario,
+            "yape_qr_configurado": qr_configurado
         }), 200
 
     # Perfil 3: consumidor. No requiere aprobación del administrador.
@@ -728,6 +792,169 @@ def propietario_actualizar_nombre_local():
         "status": "ok",
         "mensaje": "El nombre comercial se actualizó correctamente.",
         "nombre_local": nombre_local
+    }), 200
+
+
+@app.route("/api/propietario/yape/qr", methods=["POST"])
+def propietario_subir_qr_yape():
+    """Guarda/reemplaza el QR del propietario en Storage privado; no habilita cobros."""
+    usuario = str(request.form.get("usuario") or "").strip()
+    password_actual = str(request.form.get("password_actual") or "")
+    archivo = request.files.get("archivo")
+
+    _ref, _perfil, error = _verificar_propietario_para_qr(usuario, password_actual)
+    if error:
+        mensaje, codigo = error
+        return jsonify({"status": "error", "mensaje": mensaje}), codigo
+
+    if archivo is None or not archivo.filename:
+        return jsonify({"status": "error", "mensaje": "Selecciona una imagen de tu QR de Yape."}), 400
+
+    contenido = archivo.stream.read(YAPE_QR_MAX_BYTES + 1)
+    if not contenido:
+        return jsonify({"status": "error", "mensaje": "La imagen seleccionada está vacía."}), 400
+    if len(contenido) > YAPE_QR_MAX_BYTES:
+        return jsonify({"status": "error", "mensaje": "La imagen supera el límite permitido de 3 MB."}), 413
+
+    content_type, extension = _detectar_tipo_imagen_qr(contenido)
+    if not content_type:
+        return jsonify({
+            "status": "error",
+            "mensaje": "Formato no admitido. Utiliza una imagen PNG, JPG o WEBP."
+        }), 415
+
+    try:
+        bucket = _obtener_bucket_qr_yape()
+        nombre_archivo = os.path.basename(str(archivo.filename or "qr_yape"))[:100]
+        storage_path = f"yape_qr/{usuario}/{secrets.token_hex(16)}.{extension}"
+        blob = bucket.blob(storage_path)
+        blob.cache_control = "private, no-store, max-age=0"
+        blob.metadata = {
+            "propietario": usuario,
+            "uso": "qr_yape_personal"
+        }
+        blob.upload_from_string(contenido, content_type=content_type)
+
+        config_ref = db.collection("configuracion_yape").document(usuario)
+        config_anterior_doc = config_ref.get()
+        config_anterior = config_anterior_doc.to_dict() or {} if config_anterior_doc.exists else {}
+        path_anterior = str(config_anterior.get("storage_path") or "")
+
+        try:
+            config_ref.set({
+                "propietario": usuario,
+                "activo": True,
+                "storage_path": storage_path,
+                "nombre_archivo": nombre_archivo,
+                "content_type": content_type,
+                "tamano_bytes": len(contenido),
+                "validacion": "pendiente",
+                "habilitado_para_cobros": False,
+                "actualizado_en": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+        except Exception:
+            try:
+                blob.delete()
+            except Exception:
+                app.logger.exception("No se pudo limpiar un QR nuevo tras fallo al guardar Firestore.")
+            raise
+
+        if path_anterior and path_anterior != storage_path:
+            try:
+                bucket.blob(path_anterior).delete()
+            except Exception:
+                app.logger.exception("No se pudo eliminar el QR anterior del propietario %s.", usuario)
+
+        return jsonify({
+            "status": "ok",
+            "mensaje": "El QR se guardó correctamente. Los cobros siguen deshabilitados hasta completar la validación de Yape.",
+            "qr_configurado": True,
+            "activo": True,
+            "validacion": "pendiente",
+            "habilitado_para_cobros": False
+        }), 201
+    except RuntimeError as e:
+        app.logger.error("Configuración de Storage incompleta: %s", str(e))
+        return jsonify({
+            "status": "error",
+            "mensaje": "Firebase Storage no está configurado. Verifica el bucket en Render."
+        }), 503
+    except Exception:
+        app.logger.exception("Error al almacenar el QR de Yape del propietario %s.", usuario)
+        return jsonify({
+            "status": "error",
+            "mensaje": "No se pudo almacenar la imagen. Verifica Firebase Storage y vuelve a intentarlo."
+        }), 503
+
+
+@app.route("/api/propietario/yape/qr/preview", methods=["POST"])
+def propietario_previsualizar_qr_yape():
+    """Entrega el QR al propio propietario tras revalidar su contraseña; no usa URL pública."""
+    datos = request.get_json(silent=True) or {}
+    usuario = str(datos.get("usuario") or "").strip()
+    password_actual = str(datos.get("password_actual") or "")
+    _ref, _perfil, error = _verificar_propietario_para_qr(usuario, password_actual)
+    if error:
+        mensaje, codigo = error
+        return jsonify({"status": "error", "mensaje": mensaje}), codigo
+
+    config_doc = db.collection("configuracion_yape").document(usuario).get()
+    if not config_doc.exists:
+        return jsonify({"status": "error", "mensaje": "Todavía no has registrado un QR de Yape."}), 404
+    config = config_doc.to_dict() or {}
+    if config.get("activo", False) is not True or not config.get("storage_path"):
+        return jsonify({"status": "error", "mensaje": "El QR de Yape está deshabilitado o no está disponible."}), 404
+
+    try:
+        bucket = _obtener_bucket_qr_yape()
+        blob = bucket.blob(str(config["storage_path"]))
+        contenido = blob.download_as_bytes()
+        content_type = str(config.get("content_type") or "image/png")
+        response = send_file(
+            io.BytesIO(contenido),
+            mimetype=content_type,
+            as_attachment=False,
+            download_name="qr-yape-propietario"
+        )
+        response.headers["Cache-Control"] = "private, no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+    except RuntimeError as e:
+        app.logger.error("Configuración de Storage incompleta: %s", str(e))
+        return jsonify({"status": "error", "mensaje": "Firebase Storage no está configurado."}), 503
+    except Exception:
+        app.logger.exception("Error al recuperar el QR privado del propietario %s.", usuario)
+        return jsonify({"status": "error", "mensaje": "No se pudo cargar el QR guardado."}), 503
+
+
+@app.route("/api/propietario/yape/qr/desactivar", methods=["POST"])
+def propietario_desactivar_qr_yape():
+    """Deshabilita el QR sin borrar la imagen ni los registros del propietario."""
+    datos = request.get_json(silent=True) or {}
+    usuario = str(datos.get("usuario") or "").strip()
+    password_actual = str(datos.get("password_actual") or "")
+    _ref, _perfil, error = _verificar_propietario_para_qr(usuario, password_actual)
+    if error:
+        mensaje, codigo = error
+        return jsonify({"status": "error", "mensaje": mensaje}), codigo
+
+    config_ref = db.collection("configuracion_yape").document(usuario)
+    config_doc = config_ref.get()
+    if not config_doc.exists:
+        return jsonify({"status": "error", "mensaje": "No hay un QR registrado para desactivar."}), 404
+
+    config_ref.update({
+        "activo": False,
+        "habilitado_para_cobros": False,
+        "desactivado_en": firestore.SERVER_TIMESTAMP,
+        "actualizado_en": firestore.SERVER_TIMESTAMP
+    })
+    return jsonify({
+        "status": "ok",
+        "mensaje": "El QR quedó deshabilitado. La imagen se conserva para poder reemplazarla posteriormente.",
+        "qr_configurado": False,
+        "habilitado_para_cobros": False
     }), 200
 
 
@@ -1254,7 +1481,3 @@ def ingresar_moneda():
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-
-
-
-
