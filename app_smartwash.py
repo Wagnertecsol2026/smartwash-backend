@@ -360,9 +360,10 @@ def _supabase_storage_configuracion():
 def _supabase_headers(content_type=None):
     """Crea cabeceras servidor-a-servidor con la clave secreta de Supabase."""
     _supabase_storage_configuracion()
+    # Las claves sb_secret_ son claves API opacas, no JWT.
+    # Deben enviarse en apikey; no como Authorization: Bearer.
     headers = {
         "apikey": SUPABASE_SECRET_KEY,
-        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
         "Accept": "application/json",
     }
     if content_type:
@@ -536,8 +537,8 @@ def login():
         else:
             config_qr = {}
         qr_configurado = (
-            config_qr.get("activo", False) is True
-            and bool(config_qr.get("storage_path"))
+                config_qr.get("activo", False) is True
+                and bool(config_qr.get("storage_path"))
         )
 
         return jsonify({
