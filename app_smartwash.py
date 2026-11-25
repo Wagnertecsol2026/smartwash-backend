@@ -536,9 +536,10 @@ def login():
             config_qr = config_qr_doc.to_dict() or {}
         else:
             config_qr = {}
-        qr_configurado = (
-                config_qr.get("activo", False) is True
-                and bool(config_qr.get("storage_path"))
+        qr_registrado = bool(config_qr.get("storage_path"))
+        qr_activo = qr_registrado and config_qr.get("activo", False) is True
+        qr_estado = "activo" if qr_activo else (
+            "desactivado" if qr_registrado else "no_configurado"
         )
 
         return jsonify({
@@ -546,7 +547,12 @@ def login():
             "rol": "propietario",
             "usuario": usuario,
             "nombre_local": cliente.get("nombre_local") or usuario,
-            "yape_qr_configurado": qr_configurado
+            # Compatibilidad: el campo antiguo representa QR activo.
+            "yape_qr_configurado": qr_activo,
+            # Campos explícitos para diferenciar los tres estados en Flutter.
+            "yape_qr_registrado": qr_registrado,
+            "yape_qr_activo": qr_activo,
+            "yape_qr_estado": qr_estado
         }), 200
 
     # Perfil 3: consumidor. No requiere aprobación del administrador.
@@ -997,8 +1003,10 @@ def propietario_previsualizar_qr_yape():
     if not config_doc.exists:
         return jsonify({"status": "error", "mensaje": "Todavía no has registrado un QR de Yape."}), 404
     config = config_doc.to_dict() or {}
-    if config.get("activo", False) is not True or not config.get("storage_path"):
-        return jsonify({"status": "error", "mensaje": "El QR de Yape está deshabilitado o no está disponible."}), 404
+    # El propietario puede consultar su imagen incluso si el QR está desactivado.
+    # La contraseña se vuelve a comprobar arriba y la respuesta no se almacena en caché.
+    if not config.get("storage_path"):
+        return jsonify({"status": "error", "mensaje": "No hay una imagen QR guardada para esta cuenta."}), 404
 
     try:
         contenido = _supabase_descargar_qr(str(config["storage_path"]))
@@ -1047,8 +1055,77 @@ def propietario_desactivar_qr_yape():
         "status": "ok",
         "mensaje": "El QR quedó deshabilitado. La imagen se conserva para poder reemplazarla posteriormente.",
         "qr_configurado": False,
+        "qr_registrado": True,
+        "qr_activo": False,
+        "qr_estado": "desactivado",
         "habilitado_para_cobros": False
     }), 200
+
+
+@app.route("/api/propietario/yape/qr/activar", methods=["POST"])
+def propietario_reactivar_qr_yape():
+    """Reactiva el QR previamente guardado, sin habilitar pagos ni cambiar su archivo."""
+    datos = request.get_json(silent=True) or {}
+    usuario = str(datos.get("usuario") or "").strip()
+    password_actual = str(datos.get("password_actual") or "")
+    _ref, _perfil, error = _verificar_propietario_para_qr(usuario, password_actual)
+    if error:
+        mensaje, codigo = error
+        return jsonify({"status": "error", "mensaje": mensaje}), codigo
+
+    config_ref = db.collection("configuracion_yape").document(usuario)
+    config_doc = config_ref.get()
+    if not config_doc.exists:
+        return jsonify({
+            "status": "error",
+            "mensaje": "No hay un QR guardado para reactivar. Primero registra una imagen."
+        }), 404
+
+    config = config_doc.to_dict() or {}
+    storage_path = str(config.get("storage_path") or "").strip()
+    if not storage_path:
+        return jsonify({
+            "status": "error",
+            "mensaje": "No se encontró la imagen guardada. Debes registrar nuevamente el QR."
+        }), 404
+
+    try:
+        # Comprobar que el archivo privado todavía existe antes de reactivarlo.
+        imagen = _supabase_descargar_qr(storage_path)
+        if not imagen:
+            return jsonify({
+                "status": "error",
+                "mensaje": "La imagen guardada no está disponible. Sube nuevamente el QR."
+            }), 404
+
+        config_ref.update({
+            "activo": True,
+            "habilitado_para_cobros": False,
+            "validacion": "pendiente",
+            "reactivado_en": firestore.SERVER_TIMESTAMP,
+            "actualizado_en": firestore.SERVER_TIMESTAMP
+        })
+        return jsonify({
+            "status": "ok",
+            "mensaje": "El QR guardado fue reactivado. Los cobros siguen deshabilitados hasta completar su validación.",
+            "qr_configurado": True,
+            "qr_registrado": True,
+            "qr_activo": True,
+            "qr_estado": "activo",
+            "habilitado_para_cobros": False
+        }), 200
+    except RuntimeError:
+        app.logger.exception("No se pudo comprobar el QR en Supabase antes de reactivarlo.")
+        return jsonify({
+            "status": "error",
+            "mensaje": "No se pudo verificar la imagen en el almacenamiento privado. El QR permanece desactivado."
+        }), 503
+    except Exception:
+        app.logger.exception("Error al reactivar el QR del propietario %s.", usuario)
+        return jsonify({
+            "status": "error",
+            "mensaje": "No se pudo reactivar el QR. El estado anterior se conserva."
+        }), 503
 
 
 @app.route("/api/propietario/maquinas/<id_caja>/configurar_servicio", methods=["POST"])
